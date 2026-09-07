@@ -1,0 +1,2557 @@
+import os
+import io
+import json
+import zipfile
+import mimetypes
+import datetime as dt
+import re
+import urllib.request
+import urllib.error
+import http.client
+import subprocess
+import shlex
+import shutil
+import threading
+import time
+import logging
+import signal
+import faulthandler
+import secrets
+import atexit
+import sqlite3
+from pathlib import Path
+from typing import Optional, List, Tuple
+from croniter import croniter
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+# Ensure webpp is served as image/webp on systems with incomplete MIME databases
+mimetypes.add_type('image/webp', '.webp')
+
+from flask import (
+    Blueprint, render_template, request,
+    redirect, url_for, flash, send_from_directory, Response,
+    send_file, jsonify,
+)
+from flask_wtf.csrf import CSRFProtect
+from werkzeug.utils import secure_filename
+
+def _get_or_create_secret_key() -> str:
+    env_key = os.environ.get("SECRET_KEY")
+    if env_key:
+        return env_key
+    # Persist a generated key to the config volume so it survives restarts.
+    # Without this, every restart invalidates open tabs' CSRF tokens.
+    config_root = os.environ.get("CONFIG_DIR") or "/config"
+    key_path = os.path.join(config_root, ".secret_key")
+    try:
+        existing = Path(key_path).read_text().strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    new_key = secrets.token_hex(32)
+    try:
+        os.makedirs(config_root, exist_ok=True)
+        Path(key_path).write_text(new_key)
+    except Exception:
+        pass
+    return new_key
+
+
+artillery = Blueprint("artillery", __name__)
+
+
+# ---------------------------------------------------------------------
+# Logging / Debug toggles
+# ---------------------------------------------------------------------
+
+LOG_LEVEL = os.environ.get("ARTILLERY_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+
+DEBUG_REQUEST_TIMING = os.environ.get("ARTILLERY_DEBUG_REQUESTS", "0") == "1"
+DEBUG_FS_TIMING = os.environ.get("ARTILLERY_DEBUG_FS", "0") == "1"
+
+HANG_DUMP_SECONDS = int(os.environ.get("ARTILLERY_HANG_DUMP_SECONDS", "0") or "0")
+
+faulthandler.enable()
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    logging.debug("SIGUSR1 not available on this platform — faulthandler signal handler skipped")
+
+if HANG_DUMP_SECONDS > 0:
+    faulthandler.dump_traceback_later(HANG_DUMP_SECONDS, repeat=True)
+
+def _get_default_dir(env_var: str, default_subfolder: str) -> str:
+    env_val = os.environ.get(env_var)
+    if env_val:
+        return env_val
+    root_path = "/" + default_subfolder
+    try:
+        os.makedirs(root_path, exist_ok=True)
+        return root_path
+    except (PermissionError, OSError):
+        local_path = os.path.abspath(os.path.join(os.getcwd(), default_subfolder))
+        os.makedirs(local_path, exist_ok=True)
+        return local_path
+
+TASKS_ROOT = _get_default_dir("TASKS_DIR", "tasks")
+CONFIG_ROOT = _get_default_dir("CONFIG_DIR", "config")
+DOWNLOADS_ROOT = _get_default_dir("DOWNLOADS_DIR", "downloads")
+
+def get_downloads_root() -> str:
+    """Return tools download directory from Setting database table, or default DOWNLOADS_ROOT."""
+    try:
+        from app.models import Setting
+        setting = Setting.query.get("tools_downloads_dir")
+        if setting and setting.value and setting.value.strip():
+            d = setting.value.strip()
+            os.makedirs(d, exist_ok=True)
+            return d
+    except Exception:
+        pass
+    return DOWNLOADS_ROOT
+
+CONFIG_FILE  = os.path.join(CONFIG_ROOT, "gallery-dl.conf")
+KIOSKS_ROOT  = os.path.join(CONFIG_ROOT, "kiosks")
+
+
+
+DEFAULT_CONFIG_URL = os.environ.get(
+    "GALLERYDL_DEFAULT_CONFIG_URL",
+    "https://raw.githubusercontent.com/mikf/gallery-dl/master/docs/gallery-dl.conf",
+)
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+VIDEO_EXTS = {".mp4", ".webm", ".mkv"}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+
+# Sites gallery-dl can OAuth-authenticate against interactively (`gallery-dl
+# oauth:<site>`). Label is shown in the UI; the key is both the gallery-dl
+# extractor category and the `oauth:<key>` pseudo-extractor name.
+OAUTH_SITES = {
+    "deviantart": "DeviantArt",
+    "reddit":     "Reddit",
+    "tumblr":     "Tumblr",
+    "flickr":     "Flickr",
+    "mastodon":   "Mastodon",
+    "pixiv":      "Pixiv",
+}
+
+# Sites whose gallery-dl OAuth flow reads the callback code from gallery-dl's
+# stdin instead of the local HTTP listener on 127.0.0.1:6414. Pixiv's redirect
+# URI is a real HTTPS endpoint it controls (not localhost), so gallery-dl
+# can't intercept it with a local server — instead it prints instructions and
+# blocks on input() for the 'code' value (see OAuthPixiv._input_code in
+# gallery_dl's extractor/oauth.py). Everything else here uses OAuthBase's
+# default recv(), which does listen on :6414.
+OAUTH_STDIN_SITES = {"pixiv"}
+
+RECENT_DOWNLOADS_PER_TASK = int(os.environ.get("RECENT_DOWNLOADS_PER_TASK", "20"))
+RECENT_LOG_TAIL_LINES = int(os.environ.get("RECENT_LOG_TAIL_LINES", "200"))
+ONE_TIME_LOG_FILE = os.path.join(CONFIG_ROOT, "one_time_download.log")
+ONE_TIME_PID_FILE = os.path.join(CONFIG_ROOT, "one_time_download.pid")
+ONE_TIME_STOP_FILE = os.path.join(CONFIG_ROOT, "one_time_download.stop")
+ONE_TIME_LOG_TAIL_LINES = int(os.environ.get("ONE_TIME_LOG_TAIL_LINES", "50"))
+ONE_TIME_RECENT_DOWNLOADS = int(os.environ.get("ONE_TIME_RECENT_DOWNLOADS", "16"))
+
+TASK_TIMEOUT_SECONDS = int(os.environ.get("TASK_TIMEOUT_SECONDS", "0") or "0")
+TASK_CONCURRENT_MAX  = int(os.environ.get("TASK_CONCURRENT_MAX", "5"))
+MAX_ROTATED_LOGS = 5
+
+def _get_task_timeout(task_folder: str) -> Optional[int]:
+    txt = read_text(os.path.join(task_folder, "timeout.txt"))
+    if txt and txt.strip().isdigit():
+        v = int(txt.strip())
+        return v if v > 0 else None
+    return TASK_TIMEOUT_SECONDS if TASK_TIMEOUT_SECONDS > 0 else None
+
+def _rotate_logs(task_folder: str) -> None:
+    logs_path = os.path.join(task_folder, "logs.txt")
+    if not os.path.exists(logs_path) or os.path.getsize(logs_path) == 0:
+        return
+    stamp = dt.datetime.now().strftime("%Y-%m-%dT%H%M%S")
+    archived = os.path.join(task_folder, f"logs-{stamp}.txt")
+    try:
+        os.rename(logs_path, archived)
+    except Exception:
+        logging.warning("Could not rotate log for %s", task_folder, exc_info=True)
+        return
+    pat = re.compile(r'^logs-\d{4}-\d{2}-\d{2}T\d{6}\.txt$')
+    archives = sorted(f for f in os.listdir(task_folder) if pat.match(f))
+    for old in archives[:-MAX_ROTATED_LOGS]:
+        try:
+            os.remove(os.path.join(task_folder, old))
+        except Exception:
+            logging.warning("Could not remove old log archive %s", old, exc_info=True)
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_ERROR_LINE_RE = re.compile(r'\[(error|warning)\]|error:|failed to download|traceback|exception', re.IGNORECASE)
+
+def _extract_errors_from_log(logs_path: str, max_lines: int = 30) -> str:
+    """Return error/warning lines from the log with ANSI stripped.
+    Falls back to a pointer to the logs tab if nothing is found."""
+    lines = []
+    try:
+        with open(logs_path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                clean = _ANSI_RE.sub('', raw).rstrip()
+                if _ERROR_LINE_RE.search(clean):
+                    lines.append(clean)
+    except Exception:
+        return ""
+
+    if not lines:
+        return "Task exited with a non-zero code but no error lines were found. Check the Logs tab for details."
+
+    # Deduplicate consecutive identical lines then take the last max_lines
+    deduped: list[str] = []
+    prev = None
+    for line in lines:
+        if line != prev:
+            deduped.append(line)
+            prev = line
+
+    return "\n".join(deduped[-max_lines:])
+
+
+def _write_last_error(task_folder: str, message: str) -> None:
+    try:
+        Path(os.path.join(task_folder, "last_error.txt")).write_text(
+            _ANSI_RE.sub('', message).strip(), encoding="utf-8"
+        )
+    except Exception:
+        logging.warning("Could not write last_error.txt for %s", task_folder, exc_info=True)
+
+def _clear_last_error(task_folder: str) -> None:
+    p = os.path.join(task_folder, "last_error.txt")
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        logging.warning("Could not clear last_error.txt for %s", task_folder, exc_info=True)
+
+def _record_run(task_folder: str, success: bool, duration: float, stopped: bool) -> None:
+    history_path = os.path.join(task_folder, "run_history.jsonl")
+    entry = json.dumps({
+        "ts": dt.datetime.now().isoformat(),
+        "success": success,
+        "duration": round(duration, 1),
+        "stopped": stopped,
+    })
+    try:
+        with _HISTORY_LOCK:
+            with open(history_path, "a", encoding="utf-8") as f:
+                f.write(entry + "\n")
+            with open(history_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > 100:
+                with open(history_path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-100:])
+    except Exception:
+        logging.exception("Could not write run history for %s", task_folder)
+
+_HISTORY_LOCK             = threading.Lock()  # serialises concurrent run_history.jsonl writes
+_task_cond                = threading.Condition(threading.Lock())
+_task_max_concurrent: int = TASK_CONCURRENT_MAX  # overridden from saved file at startup
+_tasks_running: int       = 0   # currently executing gallery-dl processes
+_tasks_queued: int        = 0   # threads waiting for a concurrency slot
+_TASK_CONCURRENT_MAX_FILE = os.path.join(CONFIG_ROOT, "task_concurrent_max.txt")
+
+# Optional request timing
+# ---------------------------------------------------------------------
+
+if DEBUG_REQUEST_TIMING:
+    @artillery.before_app_request
+    def _t_start():
+        request._t0 = time.perf_counter()
+
+    @artillery.after_app_request
+    def _t_end(resp):
+        t0 = getattr(request, "_t0", None)
+        if t0 is not None:
+            dt_ms = (time.perf_counter() - t0) * 1000
+            logging.info("REQ %s %s -> %s (%.1fms)",
+                            request.method, request.path, resp.status_code, dt_ms)
+        return resp
+
+# A pinned/backgrounded tab can sit idle for hours (including through OS
+# sleep), so any pooled keep-alive connection the browser reuses is long
+# dead server-side by then. Forcing a fresh connection per request avoids
+# gunicorn's sync worker misparsing a reused stale socket as "Bad Request".
+@artillery.after_app_request
+def _no_keepalive(resp):
+    resp.headers["Connection"] = "close"
+    return resp
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def _utcnow() -> str:
+    return dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def slugify(name: str) -> str:
+    name = name.strip().lower()
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"[^a-z0-9-]+", "", name)
+    return name or "task"
+
+
+def ensure_data_dirs(ensure_downloads: bool = False):
+    """
+    Ensure base directories exist.
+
+    CRITICAL: do not touch /downloads unless explicitly requested.
+    """
+    t0 = time.perf_counter() if DEBUG_FS_TIMING else None
+
+    os.makedirs(TASKS_ROOT, exist_ok=True)
+    os.makedirs(CONFIG_ROOT, exist_ok=True)
+
+    if ensure_downloads:
+        os.makedirs(get_downloads_root(), exist_ok=True)
+
+    if DEBUG_FS_TIMING and t0 is not None:
+        ms = (time.perf_counter() - t0) * 1000
+        logging.info("ensure_data_dirs(downloads=%s) %.1fms", ensure_downloads, ms)
+
+
+def read_text(path: str):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read().strip() or None
+
+
+def write_text(path: str, content: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+_tool_version_cache: dict = {}
+# Requires 3-4 numeric groups (gallery-dl "1.28.5", yt-dlp "2026.07.04") so a
+# stray two-part number in a warning line — e.g. "Python 3.8" — can't match.
+_VERSION_TOKEN_RE = re.compile(r"^\d+\.\d+\.\d+(?:\.\d+)?$")
+
+def _get_tool_version(cmd: str) -> str:
+    if cmd not in _tool_version_cache:
+        try:
+            out = subprocess.check_output(
+                [cmd, "--version"], stderr=subprocess.STDOUT, timeout=5
+            ).decode().strip()
+            version = None
+            for line in out.splitlines():
+                # Also handles yt-dlp's "2026.07.04 [abcdef1] (pip)" build-tag
+                # format — the version is always the first whitespace token.
+                for token in line.split():
+                    if _VERSION_TOKEN_RE.match(token):
+                        version = token
+                        break
+                if version:
+                    break
+            # Fall back to the raw first line if nothing looked version-shaped —
+            # better than "unknown" for a tool whose output we didn't anticipate.
+            _tool_version_cache[cmd] = version or (out.splitlines()[0] if out else "unknown")
+        except Exception:
+            _tool_version_cache[cmd] = "not found"
+    return _tool_version_cache[cmd]
+
+
+
+def _is_process_running(pid: int) -> bool:
+    try:
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _get_one_time_status() -> dict:
+    running = False
+    pid = None
+    if os.path.exists(ONE_TIME_PID_FILE):
+        pid_text = read_text(ONE_TIME_PID_FILE)
+        if pid_text:
+            try:
+                pid = int(pid_text.strip())
+            except ValueError:
+                pid = None
+        if pid and _is_process_running(pid):
+            running = True
+        else:
+            try:
+                os.remove(ONE_TIME_PID_FILE)
+            except Exception:
+                logging.debug("Could not remove stale one-time PID file")
+    return {"running": running, "pid": pid}
+
+
+# In-memory cache to reduce repeated disk reads on /tasks
+_TASK_CACHE = {}
+
+# Guards the pause/resume toggle below so two overlapping requests
+# (e.g. two open tabs) can't race the check-then-act and cancel each other out.
+_PAUSE_LOCK = threading.Lock()
+
+# Coarse TTL cache for the full task list — short-circuits per-task stat sweeps
+# when nothing has changed between requests (e.g. during the 5 s polling loop).
+_TASK_LIST_CACHE: dict = {"ts": 0.0, "tasks": None}
+_TASK_LIST_TTL = 2.0  # seconds
+
+def _invalidate_task_cache() -> None:
+    _TASK_LIST_CACHE["ts"] = 0.0
+    _TASK_LIST_CACHE["tasks"] = None
+
+# Slug validation — block path traversal attempts on every <slug> route.
+_SLUG_RE = re.compile(r'^[a-z0-9][a-z0-9-]*$')
+
+def is_valid_slug(slug: str) -> bool:
+    return bool(_SLUG_RE.match(slug))
+
+# ── APScheduler ────────────────────────────────────────────────────────────────
+_bg_scheduler = BackgroundScheduler(daemon=True)
+
+def _make_cron_trigger(cron_expr: str):
+    parts = cron_expr.strip().split()
+    if len(parts) != 5:
+        return None
+    minute, hour, day, month, day_of_week = parts
+    try:
+        return CronTrigger(
+            minute=minute, hour=hour, day=day,
+            month=month, day_of_week=day_of_week,
+        )
+    except Exception:
+        return None
+
+def _run_scheduled_task(slug: str) -> None:
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return
+    if os.path.exists(os.path.join(task_folder, "paused")):
+        return
+    lock_path = os.path.join(task_folder, "lock")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        return
+    threading.Thread(target=run_task_background, args=(task_folder,), daemon=True).start()
+
+def _reschedule_task(slug: str, cron_expr: str) -> None:
+    trigger = _make_cron_trigger(cron_expr)
+    if trigger is None:
+        _unschedule_task(slug)
+        return
+    _bg_scheduler.add_job(
+        _run_scheduled_task,
+        trigger=trigger,
+        id=f"task_{slug}",
+        replace_existing=True,
+        args=[slug],
+    )
+
+def _unschedule_task(slug: str) -> None:
+    try:
+        _bg_scheduler.remove_job(f"task_{slug}")
+    except Exception:
+        logging.debug("Scheduler job task_%s not found (already removed or never added)", slug)
+
+def _acquire_task_slot() -> None:
+    global _tasks_queued, _tasks_running
+    with _task_cond:
+        _tasks_queued += 1
+        while _tasks_running >= _task_max_concurrent:
+            _task_cond.wait()
+        _tasks_queued -= 1
+        _tasks_running += 1
+
+def _release_task_slot() -> None:
+    global _tasks_running
+    with _task_cond:
+        _tasks_running -= 1
+        _task_cond.notify()
+
+def _set_task_max_concurrent(n: int) -> None:
+    global _task_max_concurrent
+    n = max(1, min(n, 50))
+    with _task_cond:
+        _task_max_concurrent = n
+        _task_cond.notify_all()
+    try:
+        Path(_TASK_CONCURRENT_MAX_FILE).write_text(str(n))
+    except Exception:
+        logging.warning("Could not save task_concurrent_max setting", exc_info=True)
+
+def _load_task_concurrent_max_from_file() -> None:
+    global _task_max_concurrent
+    try:
+        val = Path(_TASK_CONCURRENT_MAX_FILE).read_text().strip()
+        if val.isdigit():
+            v = int(val)
+            if 1 <= v <= 50:
+                with _task_cond:
+                    _task_max_concurrent = v
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logging.debug("Could not load task_concurrent_max from file", exc_info=True)
+
+
+def _load_all_schedules() -> None:
+    if not os.path.isdir(TASKS_ROOT):
+        return
+    for entry in os.listdir(TASKS_ROOT):
+        task_path = os.path.join(TASKS_ROOT, entry)
+        if not os.path.isdir(task_path):
+            continue
+        cron_expr = read_text(os.path.join(task_path, "cron.txt"))
+        if cron_expr and cron_expr.strip():
+            _reschedule_task(entry, cron_expr.strip())
+
+def _task_mtimes(task_path: str) -> dict:
+    def _mt(p):
+        try:
+            return os.path.getmtime(p)
+        except Exception:
+            return None
+    return {
+        "name": _mt(os.path.join(task_path, "name.txt")),
+        "cron": _mt(os.path.join(task_path, "cron.txt")),
+        "command": _mt(os.path.join(task_path, "command.txt")),
+        "last_run": _mt(os.path.join(task_path, "last_run.txt")),
+        "urls": _mt(os.path.join(task_path, "urls.txt")),
+        "lock": _mt(os.path.join(task_path, "lock")),
+        "paused": _mt(os.path.join(task_path, "paused")),
+        "error": _mt(os.path.join(task_path, "error")),
+        "archive":    _mt(os.path.join(task_path, "archive.sqlite")),
+        "cookies":    _mt(os.path.join(task_path, "cookies.txt")),
+        "last_error": _mt(os.path.join(task_path, "last_error.txt")),
+        "timeout":    _mt(os.path.join(task_path, "timeout.txt")),
+        "oauth_site":  _mt(os.path.join(task_path, "oauth_site.txt")),
+        "oauth_cache": _mt(os.path.join(task_path, "gallery-dl-cache.sqlite3")),
+    }
+
+def _extract_relpath_from_log_line(line: str, downloads_root: str) -> Optional[str]:
+    s = line.strip()
+    if not s:
+        return None
+
+    s = s.replace("\\", "/")
+    dr = downloads_root.replace("\\", "/").rstrip("/")
+    dr_short = dr.lstrip("/")
+
+    # Prefer full-line match to handle spaces in folders
+    media_pattern = r"(?:jpg|jpeg|png|gif|webp|mp4|webm|mkv)"
+    full_match = re.search(re.escape(dr) + r"/[^\r\n]*?\." + media_pattern, s, re.IGNORECASE)
+    if full_match:
+        cand = full_match.group(0)
+        rel = cand[len(dr):].lstrip("/")
+        if rel:
+            return rel
+
+    candidates = [tok for tok in re.split(r"\s+", s) if tok.startswith(dr)]
+    if not candidates and dr in s:
+        idx = s.find(dr)
+        if idx != -1:
+            cand = s[idx:].strip(" ,;\"'()[]")
+            candidates = [cand]
+
+    for cand in candidates:
+        if cand == dr or cand.startswith(dr + "/"):
+            rel = cand[len(dr):].lstrip("/")
+            if not rel:
+                continue
+            ext = os.path.splitext(rel)[1].lower()
+            if ext and ext in MEDIA_EXTS:
+                return rel
+        if cand.startswith(dr_short + "/"):
+            rel = cand[len(dr_short):].lstrip("/")
+            if not rel:
+                continue
+            ext = os.path.splitext(rel)[1].lower()
+            if ext and ext in MEDIA_EXTS:
+                return rel
+
+    # Fallback: search for any media path containing downloads/ without a leading slash
+    media_match = re.search(r"(?:^|\s)([^\s\"']+\.(?:jpg|jpeg|png|gif|webp|mp4|webm|mkv))(?:$|\s)", s, re.IGNORECASE)
+    if media_match:
+        cand = media_match.group(1)
+        cand = cand.strip(" ,;\"'()[]")
+        cand = cand.replace("\\", "/")
+        if dr in cand:
+            rel = cand.split(dr, 1)[-1].lstrip("/")
+            if rel:
+                return rel
+        if ("/" + dr_short + "/") in cand or cand.startswith(dr_short + "/"):
+            rel = cand.split(dr_short + "/", 1)[-1].lstrip("/")
+            if rel:
+                return rel
+
+    return None
+
+def _count_file_lines(path: str) -> int:
+    """Count lines in a file by streaming in chunks — safe for very large files."""
+    try:
+        count = 0
+        with open(path, 'rb') as f:
+            while True:
+                block = f.read(65536)
+                if not block:
+                    break
+                count += block.count(b'\n')
+        return count
+    except Exception:
+        return 0
+
+
+def _tail_lines(path: str, max_lines: int = 500, chunk_size: int = 8192) -> List[str]:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            buffer = bytearray()
+            lines = 0
+            pos = end
+            while pos > 0 and lines <= max_lines:
+                read_size = chunk_size if pos >= chunk_size else pos
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                buffer[:0] = chunk
+                lines = buffer.count(b"\n")
+            text = buffer.decode("utf-8", errors="ignore")
+            return text.splitlines()[-max_lines:]
+    except Exception:
+        return []
+
+def _recent_downloads_from_log(log_path: str, limit: int) -> List[dict]:
+    if not os.path.exists(log_path):
+        return []
+
+    lines = _tail_lines(log_path, max_lines=RECENT_LOG_TAIL_LINES)
+    items = []
+    seen = set()
+
+    for line in reversed(lines):
+        rel = _extract_relpath_from_log_line(line, get_downloads_root())
+        if not rel:
+            continue
+        if rel in seen:
+            continue
+
+        abs_path = os.path.join(get_downloads_root(), rel)
+        if not os.path.isfile(abs_path):
+            continue
+
+        ext = os.path.splitext(rel)[1].lower()
+        items.append({
+            "rel": rel,
+            "ext": ext,
+            "filename": os.path.basename(rel),
+        })
+        seen.add(rel)
+
+        if len(items) >= limit:
+            break
+
+    return items
+
+def load_tasks():
+    now = time.time()
+    if _TASK_LIST_CACHE["tasks"] is not None and now - _TASK_LIST_CACHE["ts"] < _TASK_LIST_TTL:
+        return list(_TASK_LIST_CACHE["tasks"])
+
+    ensure_data_dirs(ensure_downloads=False)
+
+    tasks = []
+    if not os.path.isdir(TASKS_ROOT):
+        return tasks
+
+    for entry in sorted(os.listdir(TASKS_ROOT)):
+        task_path = os.path.join(TASKS_ROOT, entry)
+        if not os.path.isdir(task_path):
+            continue
+
+        slug = entry
+        mtimes = _task_mtimes(task_path)
+        cached = _TASK_CACHE.get(slug)
+        if cached and cached.get("_mtimes") == mtimes:
+            tasks.append(cached["task"])
+            continue
+
+        name = read_text(os.path.join(task_path, "name.txt")) or slug
+        schedule = read_text(os.path.join(task_path, "cron.txt"))
+        command = read_text(os.path.join(task_path, "command.txt")) or "gallery-dl --input-file urls.txt"
+        last_run = read_text(os.path.join(task_path, "last_run.txt"))
+        url_count   = _count_file_lines(os.path.join(task_path, "urls.txt"))
+        has_archive = os.path.exists(os.path.join(task_path, "archive.sqlite"))
+        has_cookies = os.path.exists(os.path.join(task_path, "cookies.txt"))
+
+        lock_path   = os.path.join(task_path, "lock")
+        paused_path = os.path.join(task_path, "paused")
+        error_path  = os.path.join(task_path, "error")
+
+        if os.path.exists(lock_path):
+            status = "running"
+        elif os.path.exists(paused_path):
+            status = "paused"
+        elif os.path.exists(error_path):
+            status = "error"
+        else:
+            status = "idle"
+
+        next_run = None
+        if schedule and croniter.is_valid(schedule):
+            try:
+                next_run = croniter(schedule, dt.datetime.now()).get_next(dt.datetime).isoformat(timespec="seconds")
+            except Exception:
+                logging.warning("Could not calculate next_run for cron '%s'", schedule, exc_info=True)
+
+        last_error = ""
+        if status == "error":
+            raw_err = read_text(os.path.join(task_path, "last_error.txt")) or ""
+            last_error = _ANSI_RE.sub('', raw_err).strip()
+
+        timeout_val = read_text(os.path.join(task_path, "timeout.txt")) or ""
+
+        oauth_site = (read_text(os.path.join(task_path, "oauth_site.txt")) or "").strip()
+        oauth_authenticated = _cache_has_token(os.path.join(task_path, "gallery-dl-cache.sqlite3"))
+
+        task = {
+            "id": slug,
+            "name": name,
+            "slug": slug,
+            "schedule": schedule,
+            "next_run": next_run,
+            "status": status,
+            "last_run": last_run,
+            "task_path": task_path,
+            "urls_file": "urls.txt",
+            "command": command,
+            "url_count": url_count,
+            "has_archive": has_archive,
+            "has_cookies": has_cookies,
+            "last_error": last_error,
+            "timeout": timeout_val.strip(),
+            "oauth_site": oauth_site,
+            "oauth_authenticated": oauth_authenticated,
+        }
+        _TASK_CACHE[slug] = {"_mtimes": mtimes, "task": task}
+        tasks.append(task)
+
+    _TASK_LIST_CACHE["ts"] = time.time()
+    _TASK_LIST_CACHE["tasks"] = tasks
+    return tasks
+
+# ---------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------
+
+# ── Kiosk helpers ────────────────────────────────────────────────────────────
+
+def _kiosk_settings(kslug: str) -> dict:
+    raw = read_text(os.path.join(KIOSKS_ROOT, kslug, "settings.json"))
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        logging.warning("Could not parse kiosk settings for %s", kslug)
+        return {}
+
+def _save_kiosk_settings(kslug: str, settings: dict) -> None:
+    p = os.path.join(KIOSKS_ROOT, kslug, "settings.json")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    write_text(p, json.dumps(settings, indent=2))
+
+def _list_kiosks() -> list:
+    result = []
+    if not os.path.isdir(KIOSKS_ROOT):
+        return result
+    for kslug in sorted(os.listdir(KIOSKS_ROOT)):
+        kdir = os.path.join(KIOSKS_ROOT, kslug)
+        if not os.path.isdir(kdir):
+            continue
+        settings = _kiosk_settings(kslug)
+        idir = os.path.join(kdir, "images")
+        count = sum(1 for f in os.listdir(idir) if os.path.isfile(os.path.join(idir, f))) if os.path.isdir(idir) else 0
+        result.append({
+            "slug": kslug,
+            "name": settings.get("name", kslug),
+            "interval": settings.get("interval", 10),
+            "order": settings.get("order", "random"),
+            "image_count": count,
+        })
+    return result
+
+# ---------------------------------------------------------------------
+
+@artillery.route("/healthz", endpoint="healthz")
+def healthz():
+    return Response("ok\n", mimetype="text/plain")
+
+
+
+# ---------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------
+
+@artillery.route("/tasks", methods=["GET", "POST"], endpoint="tasks")
+def tasks():
+    if request.method == "POST":
+        # IMPORTANT: do NOT touch /downloads here.
+        ensure_data_dirs(ensure_downloads=False)
+
+        name = request.form.get("name", "").strip()
+        urls_text = request.form.get("urls", "").strip()
+        schedule = request.form.get("schedule", "").strip()
+        command = request.form.get("command", "").strip()
+        oauth_site = request.form.get("oauth_site", "").strip()
+        if oauth_site not in OAUTH_SITES:
+            oauth_site = ""
+
+        if not name:
+            flash("Task name is required.", "error")
+            return redirect(url_for("artillery.tasks"))
+
+        keep_existing_urls = request.form.get("keep_existing_urls", "0") == "1"
+        urls_upload = request.files.get("urls_file")
+
+        if not keep_existing_urls:
+            if urls_upload and urls_upload.filename:
+                raw_urls = urls_upload.read(10 * 1024 * 1024 + 1)
+                if len(raw_urls) > 10 * 1024 * 1024:
+                    flash("URLs file too large (max 10 MB).", "error")
+                    return redirect(url_for("artillery.tasks"))
+                urls_text = raw_urls.decode("utf-8", errors="replace")
+            elif urls_text:
+                url_lines = [l for l in urls_text.splitlines() if l.strip()]
+                if len(url_lines) > 100:
+                    flash(
+                        f"Too many URLs ({len(url_lines)}). Paste supports a max of 100 — "
+                        "upload a .txt file instead for larger lists.",
+                        "error",
+                    )
+                    return redirect(url_for("artillery.tasks"))
+            else:
+                flash("You need to provide at least one URL.", "error")
+                return redirect(url_for("artillery.tasks"))
+
+        slug = slugify(name)
+        task_folder = os.path.join(TASKS_ROOT, slug)
+
+        editing_flag = request.form.get("editing_flag") == "1"
+        original_slug = request.form.get("original_slug", "").strip()
+        if editing_flag and original_slug and original_slug != slug:
+            old_folder = os.path.join(TASKS_ROOT, original_slug)
+            if os.path.isdir(old_folder):
+                if os.path.isdir(task_folder):
+                    flash(f"A task named '{name}' already exists.", "error")
+                    return redirect(url_for("artillery.tasks", selected=original_slug))
+                os.rename(old_folder, task_folder)
+
+        os.makedirs(task_folder, exist_ok=True)
+
+        write_text(os.path.join(task_folder, "name.txt"), name)
+        if not keep_existing_urls:
+            write_text(os.path.join(task_folder, "urls.txt"), urls_text.strip() + "\n")
+
+        if schedule:
+            if not croniter.is_valid(schedule):
+                flash(f"Invalid cron expression '{schedule}' — task saved without a schedule.", "warning")
+                schedule = ""
+        if schedule:
+            write_text(os.path.join(task_folder, "cron.txt"), schedule)
+        else:
+            cron_path = os.path.join(task_folder, "cron.txt")
+            if os.path.exists(cron_path):
+                os.remove(cron_path)
+
+        if not command:
+            command = "gallery-dl --input-file urls.txt"
+
+        try:
+            parts = shlex.split(command)
+            if parts and parts[0] == "gallery-dl":
+                has_config_flag = any(
+                    (p in ("-c", "--config") or p.startswith("--config=")) for p in parts
+                )
+                has_dest_flag = any(
+                    (p in ("-d", "--destination") or p.startswith("--destination=")) for p in parts
+                )
+                has_cache_flag = any(
+                    (p == "--cache-file" or p.startswith("--cache-file=")) for p in parts
+                )
+
+                insert_index = 1
+                if not has_config_flag:
+                    parts.insert(insert_index, "--config")
+                    parts.insert(insert_index + 1, CONFIG_FILE)
+                    insert_index += 2
+
+                if not has_dest_flag:
+                    parts.insert(insert_index, "--destination")
+                    parts.insert(insert_index + 1, get_downloads_root())
+                    insert_index += 2
+
+                # Only ever ADD this — never remove it on a later edit, in case
+                # the user tuned the command by hand after turning OAuth off.
+                if oauth_site and not has_cache_flag:
+                    parts.insert(insert_index, "--cache-file")
+                    parts.insert(insert_index + 1, "gallery-dl-cache.sqlite3")
+
+                command = " ".join(shlex.quote(p) for p in parts)
+        except ValueError as exc:
+            logging.warning("Could not parse task command '%s': %s", command, exc)
+
+        write_text(os.path.join(task_folder, "command.txt"), command)
+
+        oauth_site_path = os.path.join(task_folder, "oauth_site.txt")
+        if oauth_site:
+            write_text(oauth_site_path, oauth_site)
+        elif os.path.exists(oauth_site_path):
+            os.remove(oauth_site_path)
+
+        cookies_file = request.files.get("cookies_file")
+        cookies_path = os.path.join(task_folder, "cookies.txt")
+        if cookies_file and cookies_file.filename:
+            raw = cookies_file.read(1 * 1024 * 1024 + 1)
+            if len(raw) > 1 * 1024 * 1024:
+                flash("Cookies file too large (max 1 MB).", "error")
+                return redirect(url_for("artillery.tasks", selected=slug))
+            text_preview = raw[:512].decode("utf-8", errors="replace")
+            first_line = text_preview.lstrip().split("\n")[0].strip()
+            if first_line and not first_line.startswith("#") and "\t" not in first_line:
+                flash("Cookies file doesn't look like a valid Netscape cookies file.", "error")
+                return redirect(url_for("artillery.tasks", selected=slug))
+            with open(cookies_path, "wb") as _cf:
+                _cf.write(raw)
+
+        if "--cookies" in command and not os.path.exists(cookies_path):
+            flash("Warning: command uses --cookies but no cookies.txt file exists for this task. Upload one via the edit form.", "warning")
+
+        logs_path = os.path.join(task_folder, "logs.txt")
+        if not os.path.exists(logs_path):
+            write_text(logs_path, "")
+
+        if schedule:
+            _reschedule_task(slug, schedule)
+        else:
+            _unschedule_task(slug)
+        _invalidate_task_cache()
+        flash("Task created (or updated).", "success")
+        return redirect(url_for("artillery.tasks", selected=slug))
+
+    ensure_data_dirs(ensure_downloads=False)
+    tasks_list = load_tasks()
+    return render_template(
+        "tasks.html", tasks=tasks_list, task_concurrent_max=_task_max_concurrent, oauth_sites=OAUTH_SITES,
+    )
+
+
+@artillery.route("/api/disk", endpoint="api_disk")
+def api_disk():
+    try:
+        usage = shutil.disk_usage(get_downloads_root())
+        return jsonify({"total": usage.total, "used": usage.used, "free": usage.free})
+    except Exception:
+        logging.warning("Could not get disk usage for %s", DOWNLOADS_ROOT, exc_info=True)
+        return jsonify({"error": "unavailable"}), 500
+
+
+@artillery.route("/api/queue", endpoint="api_queue")
+def api_queue():
+    return jsonify({
+        "running": _tasks_running,
+        "queued": _tasks_queued,
+        "max_concurrent": _task_max_concurrent,
+    })
+
+
+@artillery.route("/api/tasks", endpoint="api_tasks")
+def api_tasks():
+    """Return a lightweight JSON representation of tasks for front-end polling."""
+    ensure_data_dirs(ensure_downloads=False)
+    tasks = load_tasks()
+
+    out = []
+    for t in tasks:
+        out.append({
+            "id": t.get("id"),
+            "name": t.get("name"),
+            "slug": t.get("slug"),
+            "schedule": t.get("schedule"),
+            "next_run": t.get("next_run"),
+            "status": t.get("status"),
+            "last_run": t.get("last_run"),
+            "has_archive": t.get("has_archive", False),
+            "has_cookies": t.get("has_cookies", False),
+            "oauth_site": t.get("oauth_site", ""),
+            "oauth_authenticated": t.get("oauth_authenticated", False),
+        })
+
+    return jsonify(out)
+
+# ---------------------------------------------------------------------
+# Config page
+# ---------------------------------------------------------------------
+
+@artillery.route("/config", methods=["GET", "POST"], endpoint="config_page")
+def config_page():
+    return redirect(url_for("main.settings") + "#system-config")
+
+
+# ---------------------------------------------------------------------
+# Config update checker
+# ---------------------------------------------------------------------
+
+def _config_merge_section(user_section, github_section):
+    result = dict(user_section)
+    for key, github_value in github_section.items():
+        if key not in result:
+            continue
+        user_value = result[key]
+        if isinstance(github_value, dict) and isinstance(user_value, dict):
+            result[key] = _config_fill_options(user_value, github_value)
+    return result
+
+
+def _config_fill_options(user_options, github_options):
+    result = dict(user_options)
+    for key, github_value in github_options.items():
+        if key not in result:
+            if not isinstance(github_value, dict):
+                result[key] = github_value
+        elif isinstance(github_value, dict) and isinstance(result[key], dict):
+            result[key] = _config_fill_options(result[key], github_value)
+    return result
+
+
+def _config_merge_update(user_conf, github_conf):
+    result = dict(user_conf)
+    for key, github_value in github_conf.items():
+        if key not in result:
+            continue
+        user_value = result[key]
+        if isinstance(github_value, dict) and isinstance(user_value, dict):
+            result[key] = _config_merge_section(user_value, github_value)
+    return result
+
+
+def _collect_new_options(user_dict, github_dict):
+    new = []
+    for key, github_value in github_dict.items():
+        if key not in user_dict:
+            if not isinstance(github_value, dict):
+                new.append(key)
+        elif isinstance(github_value, dict) and isinstance(user_dict[key], dict):
+            new.extend(_collect_new_options(user_dict[key], github_value))
+    return new
+
+
+def _config_diff_new_options(user_conf, github_conf):
+    new_by_section = {}
+    for key, github_value in github_conf.items():
+        if key not in user_conf or not isinstance(github_value, dict) or not isinstance(user_conf[key], dict):
+            continue
+        for sub_key, github_sub in github_value.items():
+            if sub_key not in user_conf[key] or not isinstance(github_sub, dict) or not isinstance(user_conf[key][sub_key], dict):
+                continue
+            new_opts = _collect_new_options(user_conf[key][sub_key], github_sub)
+            if new_opts:
+                new_by_section[f"{key}.{sub_key}"] = new_opts
+    return new_by_section
+
+
+@artillery.route("/api/config/check-update", endpoint="api_config_check_update")
+def api_config_check_update():
+    try:
+        with urllib.request.urlopen(DEFAULT_CONFIG_URL, timeout=10) as resp:
+            github_text = resp.read().decode("utf-8")
+        github_conf = json.loads(github_text)
+    except Exception as exc:
+        return jsonify({"error": str(exc)})
+
+    local_text = read_text(CONFIG_FILE) or "{}"
+    try:
+        local_conf = json.loads(local_text)
+    except json.JSONDecodeError as exc:
+        return jsonify({"error": f"Local config is not valid JSON: {exc}"})
+
+    new_by_section = _config_diff_new_options(local_conf, github_conf)
+    total = sum(len(v) for v in new_by_section.values())
+    if total == 0:
+        return jsonify({"up_to_date": True})
+
+    lines = []
+    for section, opts in sorted(new_by_section.items()):
+        sample = ", ".join(opts[:6])
+        if len(opts) > 6:
+            sample += f", … +{len(opts) - 6} more"
+        lines.append(f"<strong>{section}</strong>: {sample}")
+
+    return jsonify({
+        "up_to_date": False,
+        "total": total,
+        "section_count": len(new_by_section),
+        "summary_html": "<br>".join(lines),
+    })
+
+
+@artillery.route("/api/config/apply-update", methods=["POST"], endpoint="api_config_apply_update")
+def api_config_apply_update():
+    try:
+        with urllib.request.urlopen(DEFAULT_CONFIG_URL, timeout=10) as resp:
+            github_text = resp.read().decode("utf-8")
+        github_conf = json.loads(github_text)
+    except Exception as exc:
+        return jsonify({"error": str(exc)})
+
+    local_text = read_text(CONFIG_FILE) or "{}"
+    try:
+        local_conf = json.loads(local_text)
+    except json.JSONDecodeError as exc:
+        return jsonify({"error": f"Local config is not valid JSON: {exc}"})
+
+    stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_path = CONFIG_FILE + f".bak.{stamp}"
+    try:
+        Path(backup_path).write_text(local_text, encoding="utf-8")
+    except Exception as exc:
+        return jsonify({"error": f"Failed to create backup: {exc}"})
+
+    merged = _config_merge_update(local_conf, github_conf)
+    try:
+        merged_text = json.dumps(merged, indent=4, ensure_ascii=False)
+        write_text(CONFIG_FILE, merged_text)
+    except Exception as exc:
+        return jsonify({"error": f"Failed to save config: {exc}"})
+
+    return jsonify({"ok": True, "backup": os.path.basename(backup_path)})
+
+
+# ---------------------------------------------------------------------
+# Tool (gallery-dl / yt-dlp) version updates
+# ---------------------------------------------------------------------
+
+_UPDATABLE_TOOLS = ("gallery-dl", "yt-dlp")
+
+def _get_latest_pypi_version(pkg: str) -> str:
+    with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/json", timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["info"]["version"]
+
+
+def _version_tuple(v: str):
+    """Numeric key for comparing version strings, e.g. "2026.07.04" == "2026.7.4"
+    (yt-dlp's `--version` prints zero-padded CalVer; PyPI reports the PEP 440-
+    normalized, unpadded form — same release, different string). Falls back to
+    None for anything that isn't cleanly dot-numeric, so callers can fall back
+    to a plain string comparison instead."""
+    try:
+        return tuple(int(p) for p in v.split("."))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _busy_task_names() -> list:
+    """Task names currently mid-run, plus the ad-hoc one-time downloader if active —
+    used to warn before an in-place gallery-dl/yt-dlp upgrade."""
+    names = [t["name"] for t in load_tasks() if t.get("status") == "running"]
+    if _get_one_time_status().get("running"):
+        names.append("One-time download")
+    return names
+
+
+@artillery.route("/api/tools/check-update", endpoint="api_tools_check_update")
+def api_tools_check_update():
+    out = {}
+    for tool in _UPDATABLE_TOOLS:
+        current = _get_tool_version(tool)
+        entry = {"current": current}
+        try:
+            latest = _get_latest_pypi_version(tool)
+            entry["latest"] = latest
+            current_v, latest_v = _version_tuple(current), _version_tuple(latest)
+            same = (current_v == latest_v) if (current_v is not None and latest_v is not None) else (current == latest)
+            entry["update_available"] = (
+                bool(latest) and current not in ("not found", "unknown", "") and not same
+            )
+        except Exception as exc:
+            entry["error"] = str(exc)
+        out[tool] = entry
+    return jsonify(out)
+
+
+@artillery.route("/api/tools/update", methods=["POST"], endpoint="api_tools_update")
+def api_tools_update():
+    tool = request.form.get("tool", "").strip()
+    if tool not in _UPDATABLE_TOOLS:
+        return jsonify({"error": f"Unknown tool '{tool}'"}), 400
+
+    force = request.form.get("force") == "1"
+    busy = _busy_task_names()
+    if busy and not force:
+        return jsonify({"warning": True, "running": busy})
+
+    try:
+        proc = subprocess.run(
+            ["pip", "install", "--no-cache-dir", "--upgrade", tool],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as exc:
+        return jsonify({"error": f"Failed to run pip: {exc}"}), 500
+
+    output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    if proc.returncode != 0:
+        return jsonify({"error": "pip install failed", "output": output[-4000:]}), 500
+
+    _tool_version_cache.pop(tool, None)  # force a re-probe instead of serving the stale cached version
+    new_version = _get_tool_version(tool)
+    logging.info("Updated %s -> %s", tool, new_version)
+    return jsonify({"ok": True, "new_version": new_version, "output": output[-4000:]})
+
+
+# ---------------------------------------------------------------------
+# Backup / Restore
+# ---------------------------------------------------------------------
+
+@artillery.route("/config/backup", methods=["POST"], endpoint="config_backup")
+def config_backup():
+    ensure_data_dirs(ensure_downloads=False)
+    selected_slugs = request.form.getlist("slugs")
+    include_config = request.form.get("include_config") == "1"
+
+    SKIP_FILES = {"lock", "pid", "stopped"}
+    stamp = dt.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+    zip_name = f"artillery-backup-{stamp}.zip"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for slug in selected_slugs:
+            if not is_valid_slug(slug):
+                continue
+            task_dir = os.path.join(TASKS_ROOT, slug)
+            if not os.path.isdir(task_dir):
+                continue
+            for fn in os.listdir(task_dir):
+                if fn in SKIP_FILES:
+                    continue
+                fp = os.path.join(task_dir, fn)
+                if os.path.isfile(fp):
+                    zf.write(fp, f"tasks/{slug}/{fn}")
+
+        if include_config and os.path.isfile(CONFIG_FILE):
+            zf.write(CONFIG_FILE, f"config/{os.path.basename(CONFIG_FILE)}")
+
+        if os.path.isdir(KIOSKS_ROOT):
+            for kname in os.listdir(KIOSKS_ROOT):
+                kdir = os.path.join(KIOSKS_ROOT, kname)
+                if not os.path.isdir(kdir):
+                    continue
+                for root, _dirs, files in os.walk(kdir):
+                    for fn in files:
+                        fp = os.path.join(root, fn)
+                        arcname = "config/kiosks/" + kname + "/" + os.path.relpath(fp, kdir)
+                        zf.write(fp, arcname)
+
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=zip_name)
+
+
+@artillery.route("/config/restore", methods=["POST"], endpoint="config_restore")
+def config_restore():
+    ensure_data_dirs(ensure_downloads=False)
+    f = request.files.get("backup_zip")
+    if not f or not f.filename.endswith(".zip"):
+        flash("Please upload a valid .zip backup file.", "error")
+        return redirect(url_for("artillery.config_page") + "#tabBackup")
+
+    raw = f.read(200 * 1024 * 1024 + 1)
+    if len(raw) > 200 * 1024 * 1024:
+        flash("Backup file too large (max 200 MB).", "error")
+        return redirect(url_for("artillery.config_page") + "#tabBackup")
+
+    restored_tasks, restored_kiosks = [], []
+    restored_config = False
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            for info in zf.infolist():
+                name = info.filename.replace("\\", "/")
+                if ".." in name or name.startswith("/"):
+                    logging.warning("Backup restore: skipping unsafe path %s", name)
+                    continue
+
+                if name.startswith("tasks/") and not name.endswith("/"):
+                    parts = name.split("/")
+                    if len(parts) >= 3:
+                        slug = parts[1]
+                        if is_valid_slug(slug):
+                            dest = os.path.join(TASKS_ROOT, slug, "/".join(parts[2:]))
+                            os.makedirs(os.path.dirname(dest), exist_ok=True)
+                            with zf.open(info) as src, open(dest, "wb") as dst:
+                                dst.write(src.read())
+                            if slug not in restored_tasks:
+                                restored_tasks.append(slug)
+
+                elif name.startswith("config/kiosks/") and not name.endswith("/"):
+                    parts = name.split("/")
+                    if len(parts) >= 4:
+                        kname = parts[2]
+                        if is_valid_slug(kname):
+                            rel = "/".join(parts[3:])
+                            dest = os.path.join(KIOSKS_ROOT, kname, rel)
+                            os.makedirs(os.path.dirname(dest), exist_ok=True)
+                            with zf.open(info) as src, open(dest, "wb") as dst:
+                                dst.write(src.read())
+                            if kname not in restored_kiosks:
+                                restored_kiosks.append(kname)
+
+                elif name.startswith("config/") and not name.endswith("/") and "kiosks" not in name:
+                    fn = os.path.basename(name)
+                    if fn:
+                        dest = os.path.join(CONFIG_ROOT, fn)
+                        with zf.open(info) as src, open(dest, "wb") as dst:
+                            dst.write(src.read())
+                        restored_config = True
+
+    except zipfile.BadZipFile:
+        flash("Invalid or corrupted zip file.", "error")
+        return redirect(url_for("artillery.config_page") + "#tabBackup")
+    except Exception as exc:
+        logging.exception("Backup restore failed")
+        flash(f"Restore failed: {exc}", "error")
+        return redirect(url_for("artillery.config_page") + "#tabBackup")
+
+    for slug in restored_tasks:
+        cron_expr = read_text(os.path.join(TASKS_ROOT, slug, "cron.txt"))
+        if cron_expr and cron_expr.strip():
+            _reschedule_task(slug, cron_expr.strip())
+    _invalidate_task_cache()
+
+    parts = []
+    if restored_tasks:
+        parts.append(f"{len(restored_tasks)} task(s): {', '.join(restored_tasks)}")
+    if restored_config:
+        parts.append("gallery-dl config")
+    if restored_kiosks:
+        parts.append(f"{len(restored_kiosks)} kiosk(s)")
+    flash("Restored: " + ("; ".join(parts) if parts else "nothing found in zip."), "success")
+    return redirect(url_for("artillery.config_page") + "#tabBackup")
+
+@artillery.route("/one-time", methods=["GET", "POST"], endpoint="one_time_download")
+def one_time_download():
+    ensure_data_dirs(ensure_downloads=True)
+    entered_url = ""
+    status = _get_one_time_status()
+
+    if request.method == "POST":
+        entered_url = request.form.get("url", "").strip()
+        if status["running"]:
+            flash("A one-time download is already running.", "error")
+            return redirect(url_for("artillery.one_time_download"))
+        if not entered_url:
+            flash("Please enter a URL.", "error")
+            return redirect(url_for("artillery.one_time_download"))
+        if shutil.which("gallery-dl") is None:
+            flash("gallery-dl is not available on the PATH.", "error")
+            return redirect(url_for("artillery.one_time_download"))
+
+        # Destination override: default to the configured downloads root. The
+        # path is resolved here (inside the request/app context) so the
+        # background thread and any created task can reuse it safely.
+        destination = (request.form.get("destination", "") or "").strip()
+        if destination:
+            destination = os.path.expanduser(destination)
+            destination = os.path.abspath(destination)
+            try:
+                os.makedirs(destination, exist_ok=True)
+            except Exception as exc:
+                logging.warning("Could not create destination %s: %s", destination, exc)
+                flash(f"Could not create destination directory: {destination}", "error")
+                return redirect(url_for("artillery.one_time_download"))
+        else:
+            destination = get_downloads_root()
+
+        # Optionally create a task from the URL before downloading.
+        also_add_task = request.form.get("also_add_task") == "1"
+        task_name = request.form.get("task_name", "").strip()
+        if also_add_task:
+            if not task_name:
+                flash("Please provide a task name when adding as a task.", "error")
+                return redirect(url_for("artillery.one_time_download"))
+            ensure_data_dirs(ensure_downloads=False)
+            task_slug = slugify(task_name)
+            task_folder = os.path.join(TASKS_ROOT, task_slug)
+            os.makedirs(task_folder, exist_ok=True)
+            write_text(os.path.join(task_folder, "name.txt"), task_name)
+            write_text(os.path.join(task_folder, "urls.txt"), entered_url + "\n")
+            # Build the same command the task form would produce, using the
+            # chosen destination (falling back to the configured downloads root).
+            cmd_parts = [
+                "gallery-dl",
+                "--config", CONFIG_FILE,
+                "--destination", destination,
+                "--input-file", "urls.txt",
+            ]
+            task_command = " ".join(shlex.quote(p) for p in cmd_parts)
+            write_text(os.path.join(task_folder, "command.txt"), task_command)
+            logs_path = os.path.join(task_folder, "logs.txt")
+            if not os.path.exists(logs_path):
+                write_text(logs_path, "")
+            _invalidate_task_cache()
+            flash(f"Task \"{task_name}\" created.", "success")
+
+        try:
+            if os.path.exists(ONE_TIME_STOP_FILE):
+                os.remove(ONE_TIME_STOP_FILE)
+        except Exception:
+            logging.debug("Could not remove stale one-time stop file before start")
+
+        resolved_download_dir = destination
+        thread = threading.Thread(target=run_one_time_download, args=(entered_url, resolved_download_dir), daemon=True)
+        thread.start()
+        flash("One-time download started in the background.", "success")
+        return redirect(url_for("artillery.one_time_download"))
+
+    return render_template(
+        "one_time.html",
+        config_path=CONFIG_FILE,
+        download_root=get_downloads_root(),
+        entered_url=entered_url,
+        running=status["running"],
+    )
+
+@artillery.route("/one-time/logs", endpoint="one_time_download_logs")
+def one_time_logs():
+    ensure_data_dirs(ensure_downloads=False)
+    tail = request.args.get("tail", type=int)
+    content = ""
+    try:
+        if os.path.exists(ONE_TIME_LOG_FILE):
+            if tail and tail > 0:
+                content = "\n".join(_tail_lines(ONE_TIME_LOG_FILE, tail))
+            else:
+                content = read_text(ONE_TIME_LOG_FILE) or ""
+        else:
+            content = "No logs yet."
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({
+        "running": _get_one_time_status()["running"],
+        "content": content,
+    })
+
+@artillery.route("/one-time/logs/download", endpoint="download_one_time_logs")
+def one_time_download_logs():
+    ensure_data_dirs(ensure_downloads=False)
+    if not os.path.exists(ONE_TIME_LOG_FILE):
+        return jsonify({"error": "No one-time download log exists."}), 404
+    try:
+        return send_file(ONE_TIME_LOG_FILE, as_attachment=True, download_name="one_time_download.log")
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+@artillery.route("/one-time/recent", endpoint="one_time_recent")
+def one_time_recent():
+    ensure_data_dirs(ensure_downloads=False)
+    items = _recent_downloads_from_log(ONE_TIME_LOG_FILE, ONE_TIME_RECENT_DOWNLOADS)
+    out = []
+    for item in items:
+        item_url = url_for("artillery.media_file", subpath=item["rel"])
+        out.append({
+            "rel": item["rel"],
+            "url": item_url,
+            "filename": item.get("filename") or os.path.basename(item["rel"]),
+            "is_image": item.get("ext") in IMAGE_EXTS,
+            "is_video": item.get("ext") in VIDEO_EXTS,
+        })
+    return jsonify({"items": out})
+
+@artillery.route("/one-time/status", endpoint="one_time_status")
+def one_time_status():
+    status = _get_one_time_status()
+    return jsonify({"running": status["running"]})
+
+@artillery.route("/one-time/clear-logs", methods=["POST"], endpoint="one_time_clear_logs")
+def one_time_clear_logs():
+    try:
+        write_text(ONE_TIME_LOG_FILE, "")
+        flash("One-time download log cleared.", "success")
+    except Exception as exc:
+        flash(f"Failed to clear one-time log: {exc}", "error")
+    return redirect(url_for("artillery.one_time_download"))
+
+@artillery.route("/one-time/stop", methods=["POST"], endpoint="one_time_stop")
+def one_time_stop():
+    status = _get_one_time_status()
+    if not status["running"]:
+        flash("No one-time download is currently running.", "info")
+        return redirect(url_for("artillery.one_time_download"))
+
+    pid_text = read_text(ONE_TIME_PID_FILE)
+    if pid_text:
+        try:
+            pid = int(pid_text.strip())
+            Path(ONE_TIME_STOP_FILE).touch()
+            os.kill(pid, signal.SIGTERM)
+            flash("Stop signal sent to one-time download.", "success")
+        except ProcessLookupError:
+            flash("One-time download process is not running.", "info")
+        except Exception as exc:
+            flash(f"Failed to stop one-time download: {exc}", "error")
+    else:
+        flash("Could not read one-time download PID.", "error")
+    return redirect(url_for("artillery.one_time_download"))
+
+# ---------------------------------------------------------------------
+# Task actions
+# ---------------------------------------------------------------------
+
+def run_one_time_download(url: str, download_dir: str | None = None):
+    if download_dir is None:
+        download_dir = DOWNLOADS_ROOT
+    ensure_data_dirs(ensure_downloads=True)
+    try:
+        if os.path.exists(ONE_TIME_STOP_FILE):
+            os.remove(ONE_TIME_STOP_FILE)
+    except Exception:
+        logging.debug("Could not remove one-time stop file before run")
+
+    env = os.environ.copy()
+    env["GALLERY_DL_CONFIG"] = CONFIG_FILE
+    env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/local/bin"
+
+    cmd_parts = [
+        "gallery-dl",
+        "--config",
+        CONFIG_FILE,
+        "--destination",
+        download_dir,
+        url,
+    ]
+
+    now = dt.datetime.now().isoformat()
+    try:
+        with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
+            logf.write(f"\n\n==== One-time download started at {now} ====\n")
+            logf.write(f"URL: {url}\n")
+            logf.write(f"Command: {' '.join(shlex.quote(p) for p in cmd_parts)}\n\n")
+            logf.flush()
+
+            proc = subprocess.Popen(
+                cmd_parts,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            try:
+                Path(ONE_TIME_PID_FILE).write_text(str(proc.pid))
+            except Exception:
+                logging.warning("Could not write one-time PID file", exc_info=True)
+
+            while proc.poll() is None:
+                if os.path.exists(ONE_TIME_STOP_FILE):
+                    try:
+                        proc.terminate()
+                        logf.write("\nStop requested. Terminating one-time download...\n")
+                        logf.flush()
+                    except Exception:
+                        logging.warning("Could not terminate one-time download process", exc_info=True)
+                time.sleep(0.25)
+
+            returncode = proc.returncode
+
+        with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
+            if returncode == 0:
+                logf.write("\nOne-time download finished successfully.\n")
+            else:
+                logf.write(f"\nOne-time download exited with code {returncode}.\n")
+    except Exception as exc:
+        with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
+            logf.write(f"\nERROR while running one-time download: {exc}\n")
+    finally:
+        try:
+            if os.path.exists(ONE_TIME_PID_FILE):
+                os.remove(ONE_TIME_PID_FILE)
+        except Exception:
+            logging.debug("Could not remove one-time PID file in cleanup")
+        try:
+            if os.path.exists(ONE_TIME_STOP_FILE):
+                os.remove(ONE_TIME_STOP_FILE)
+        except Exception:
+            logging.debug("Could not remove one-time stop file in cleanup")
+
+
+def run_task_background(task_folder: str):
+    _acquire_task_slot()
+    ensure_data_dirs(ensure_downloads=True)
+
+    lock_path     = os.path.join(task_folder, "lock")
+    pid_path      = os.path.join(task_folder, "pid")
+    stopped_path  = os.path.join(task_folder, "stopped")
+    logs_path     = os.path.join(task_folder, "logs.txt")
+    last_run_path = os.path.join(task_folder, "last_run.txt")
+    command_path  = os.path.join(task_folder, "command.txt")
+    urls_file     = os.path.join(task_folder, "urls.txt")
+    error_path    = os.path.join(task_folder, "error")
+
+    # Rotate previous log and clear transient state before starting
+    _rotate_logs(task_folder)
+    _clear_last_error(task_folder)
+    try:
+        if os.path.exists(error_path):
+            os.remove(error_path)
+    except Exception:
+        logging.warning("Could not remove error sentinel for %s", task_folder, exc_info=True)
+
+    command = read_text(command_path)
+    if not command:
+        with open(logs_path, "a", encoding="utf-8") as logf:
+            logf.write("\nNo command configured for this task.\n")
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+        _release_task_slot()
+        return
+
+    if not os.path.exists(urls_file):
+        with open(logs_path, "a", encoding="utf-8") as logf:
+            logf.write("\nurls.txt not found for this task.\n")
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+        _release_task_slot()
+        return
+
+    now = dt.datetime.now().isoformat()
+
+    try:
+        cmd_parts = shlex.split(command)
+    except ValueError as exc:
+        with open(logs_path, "a", encoding="utf-8") as logf:
+            logf.write(f"\nFailed to parse command: {exc}\n")
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+        _release_task_slot()
+        return
+
+    env = os.environ.copy()
+    env["GALLERY_DL_CONFIG"] = CONFIG_FILE
+    env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/local/bin"
+
+    try:
+        with open(logs_path, "a", encoding="utf-8") as logf:
+            config_exists = os.path.exists(CONFIG_FILE)
+            logf.write(f"\n\n==== Run at {now} ====\n")
+            logf.write(f"Artillery: using config {CONFIG_FILE} (exists={config_exists})\n")
+            logf.write(f"$ {' '.join(cmd_parts)}\n\n")
+            logf.flush()
+
+            proc = subprocess.Popen(
+                cmd_parts,
+                cwd=task_folder,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            try:
+                Path(pid_path).write_text(str(proc.pid))
+            except Exception:
+                logging.warning("Could not write PID file for %s", task_folder, exc_info=True)
+
+            timeout = _get_task_timeout(task_folder)
+            timed_out = False
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                returncode = -1
+                timed_out = True
+                logf.write(f"\nTask killed: exceeded {timeout}s timeout.\n")
+                logf.flush()
+
+        run_end = dt.datetime.now()
+        duration = (run_end - dt.datetime.fromisoformat(now)).total_seconds()
+        write_text(last_run_path, now)
+
+        was_stopped = os.path.exists(stopped_path)
+        try:
+            if was_stopped:
+                os.remove(stopped_path)
+        except Exception:
+            logging.debug("Could not remove stopped sentinel for %s", task_folder)
+
+        success = returncode == 0 and not timed_out
+        with open(logs_path, "a", encoding="utf-8") as logf:
+            if success:
+                logf.write("\nTask finished successfully.\n")
+            elif was_stopped:
+                logf.write("\nTask stopped.\n")
+            elif timed_out:
+                logf.write(f"\nTask timed out after {timeout}s.\n")
+                Path(error_path).touch()
+                _write_last_error(task_folder, f"Timed out after {timeout}s.")
+            else:
+                logf.write(f"\nTask exited with code {returncode}.\n")
+                Path(error_path).touch()
+                _write_last_error(task_folder, _extract_errors_from_log(logs_path))
+
+        _record_run(task_folder, success=success, duration=duration, stopped=was_stopped)
+
+    except Exception as exc:
+        logging.exception("Unhandled error in run_task_background for %s", task_folder)
+        with open(logs_path, "a", encoding="utf-8") as logf:
+            logf.write(f"\nERROR while running task: {exc}\n")
+        try:
+            Path(error_path).touch()
+            _write_last_error(task_folder, str(exc))
+        except Exception:
+            logging.warning("Could not write error sentinel after task crash for %s", task_folder, exc_info=True)
+        _record_run(task_folder, success=False, duration=0, stopped=False)
+    finally:
+        _release_task_slot()
+        for p in (lock_path, pid_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                logging.debug("Could not remove lock/pid file %s in cleanup", p)
+
+        try:
+            slug = os.path.basename(task_folder.rstrip("/"))
+            _TASK_CACHE.pop(slug, None)
+            _invalidate_task_cache()
+            logging.info("task %s finished", slug)
+        except Exception:
+            logging.exception("Error in post-run cleanup for %s", task_folder)
+
+
+@artillery.route("/tasks/<slug>/action", methods=["POST"], endpoint="task_action")
+def task_action(slug):
+    if not is_valid_slug(slug):
+        flash("Invalid task identifier.", "error")
+        return redirect(url_for("artillery.tasks"))
+    ensure_data_dirs(ensure_downloads=False)
+    action = request.form.get("action")
+    task_folder = os.path.join(TASKS_ROOT, slug)
+
+    if not os.path.isdir(task_folder):
+        flash("Task not found.", "error")
+        return redirect(url_for("artillery.tasks"))
+
+    if action == "duplicate":
+        src_name = read_text(os.path.join(task_folder, "name.txt")).strip() or slug
+        base_name = f"{src_name} copy"
+        new_name = base_name
+        counter = 2
+        while os.path.isdir(os.path.join(TASKS_ROOT, slugify(new_name))):
+            new_name = f"{base_name} {counter}"
+            counter += 1
+        new_slug = slugify(new_name)
+        new_folder = os.path.join(TASKS_ROOT, new_slug)
+        os.makedirs(new_folder)
+        for fname in ("urls.txt", "command.txt", "cron.txt", "cookies.txt"):
+            src = os.path.join(task_folder, fname)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(new_folder, fname))
+        write_text(os.path.join(new_folder, "name.txt"), new_name)
+        write_text(os.path.join(new_folder, "logs.txt"), "")
+        _invalidate_task_cache()
+        flash(f"Task duplicated as '{new_name}'.", "success")
+        return redirect(url_for("artillery.tasks", selected=new_slug))
+
+    if action == "delete":
+        try:
+            shutil.rmtree(task_folder)
+            _unschedule_task(slug)
+            _invalidate_task_cache()
+            flash(f"Task '{slug}' deleted.", "success")
+        except Exception as exc:
+            flash(f"Failed to delete task: {exc}", "error")
+        return redirect(url_for("artillery.tasks"))
+
+    if action == "run":
+        paused_path = os.path.join(task_folder, "paused")
+        if os.path.exists(paused_path):
+            flash("Task is paused. Unpause it before running.", "error")
+            return redirect(url_for("artillery.tasks", selected=slug))
+
+        lock_path = os.path.join(task_folder, "lock")
+        ensure_data_dirs(ensure_downloads=True)
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except FileExistsError:
+            flash("Task is already running.", "error")
+            return redirect(url_for("artillery.tasks", selected=slug))
+
+        _invalidate_task_cache()
+        t = threading.Thread(target=run_task_background, args=(task_folder,), daemon=True)
+        t.start()
+
+        flash("Task started in background. Check logs.txt for progress.", "success")
+        return redirect(url_for("artillery.tasks", selected=slug))
+
+    if action == "pause":
+        paused_path = os.path.join(task_folder, "paused")
+        with _PAUSE_LOCK:
+            if os.path.exists(paused_path):
+                os.remove(paused_path)
+                flash("Task unpaused.", "success")
+            else:
+                Path(paused_path).touch()
+                flash("Task paused.", "success")
+        _invalidate_task_cache()
+        return redirect(url_for("artillery.tasks", selected=slug))
+
+    if action == "stop":
+        pid_path = os.path.join(task_folder, "pid")
+        pid_text = read_text(pid_path)
+        if not pid_text:
+            flash("Task does not appear to be running.", "info")
+            return redirect(url_for("artillery.tasks", selected=slug))
+        try:
+            Path(os.path.join(task_folder, "stopped")).touch()
+            os.kill(int(pid_text), signal.SIGTERM)
+            flash("Stop signal sent.", "success")
+        except ProcessLookupError:
+            flash("Process already finished.", "info")
+        except ValueError:
+            flash("Invalid PID file.", "error")
+        except Exception as exc:
+            flash(f"Failed to stop task: {exc}", "error")
+        _invalidate_task_cache()
+        return redirect(url_for("artillery.tasks", selected=slug))
+
+    if action == "clear_logs":
+        logs_path = os.path.join(task_folder, "logs.txt")
+        try:
+            write_text(logs_path, "")
+            flash("Logs cleared.", "success")
+        except Exception as exc:
+            flash(f"Failed to clear logs: {exc}", "error")
+        return redirect(url_for("artillery.tasks", selected=slug))
+
+    if action == "delete_archive":
+        archive_path = os.path.join(task_folder, "archive.sqlite")
+        if os.path.exists(archive_path):
+            try:
+                os.remove(archive_path)
+                _invalidate_task_cache()
+                flash("Archive deleted. gallery-dl will re-download previously seen items on next run.", "success")
+            except Exception as exc:
+                flash(f"Failed to delete archive: {exc}", "error")
+            return redirect(url_for("artillery.tasks", selected=slug))
+        else:
+            flash("No archive file found for this task.", "info")
+            return redirect(url_for("artillery.tasks", selected=slug))
+
+    if action == "delete_cookies":
+        cookies_path = os.path.join(task_folder, "cookies.txt")
+        if os.path.exists(cookies_path):
+            try:
+                os.remove(cookies_path)
+                _invalidate_task_cache()
+                flash("Cookies deleted.", "success")
+            except Exception as exc:
+                flash(f"Failed to delete cookies: {exc}", "error")
+        else:
+            flash("No cookies file found for this task.", "info")
+        return redirect(url_for("artillery.tasks", selected=slug))
+
+    flash("Unknown action.", "error")
+    return redirect(url_for("artillery.tasks", selected=slug))
+
+@artillery.route("/tasks/<slug>/logs", endpoint="task_logs")
+def task_logs(slug):
+    if not is_valid_slug(slug):
+        return jsonify({"error": "Invalid task identifier"}), 400
+    ensure_data_dirs(ensure_downloads=False)
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+    
+    logs_path = os.path.join(task_folder, "logs.txt")
+
+    try:
+        if os.path.exists(logs_path):
+            tail = request.args.get('tail', type=int)
+            if tail and tail > 0:
+                content = '\n'.join(_tail_lines(logs_path, tail))
+            else:
+                with open(logs_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+        else:
+            content = "No logs yet. Task has not been run."
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    
+    return jsonify({"slug": slug, "content": content})
+
+
+# ---------------------------------------------------------------------
+# Task URLs endpoint (lazy-loaded by the UI)
+# ---------------------------------------------------------------------
+
+@artillery.route("/tasks/<slug>/urls", endpoint="task_urls")
+def task_urls(slug):
+    if not is_valid_slug(slug):
+        return jsonify({"error": "Invalid task identifier"}), 400
+    ensure_data_dirs(ensure_downloads=False)
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+    urls_path = os.path.join(task_folder, "urls.txt")
+    try:
+        content = read_text(urls_path) or ""
+        return jsonify({"slug": slug, "content": content})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@artillery.route("/tasks/<slug>/history", endpoint="task_history")
+def task_history(slug):
+    if not is_valid_slug(slug):
+        return jsonify({"error": "Invalid task identifier"}), 400
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+    history_path = os.path.join(task_folder, "run_history.jsonl")
+    runs = []
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            runs.append(json.loads(line))
+                        except Exception:
+                            logging.debug("Skipping malformed history line for %s: %s", slug, repr(line))
+        except Exception:
+            logging.warning("Could not read run history for %s", slug, exc_info=True)
+    return jsonify({"slug": slug, "runs": list(reversed(runs[-50:]))})
+
+@artillery.route("/tasks/<slug>/recent", endpoint="task_recent")
+def task_recent(slug):
+    if not is_valid_slug(slug):
+        return jsonify({"error": "Invalid task identifier"}), 400
+    ensure_data_dirs(ensure_downloads=False)
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+    log_path = os.path.join(task_folder, "logs.txt")
+    items = _recent_downloads_from_log(log_path, RECENT_DOWNLOADS_PER_TASK)
+    for item in items:
+        item["url"] = url_for("artillery.media_file", subpath=item["rel"])
+        item["is_image"] = item["ext"] in IMAGE_EXTS
+        item["is_video"] = item["ext"] in VIDEO_EXTS
+    return jsonify({"slug": slug, "items": items})
+
+
+# ---------------------------------------------------------------------
+# SSE log streaming
+# ---------------------------------------------------------------------
+
+@artillery.route("/tasks/<slug>/logs/stream", endpoint="stream_task_logs")
+def task_logs_stream(slug):
+    if not is_valid_slug(slug):
+        return Response("", status=400)
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return Response("", status=404)
+
+    def gen():
+        logs_path = os.path.join(task_folder, "logs.txt")
+        last_pos = 0
+        if os.path.exists(logs_path):
+            initial = "\n".join(_tail_lines(logs_path, 50))
+            yield f"data: {json.dumps({'content': initial, 'reset': True})}\n\n"
+            try:
+                last_pos = os.path.getsize(logs_path)
+            except Exception:
+                logging.debug("Could not get initial size of log file %s", logs_path)
+        else:
+            yield f"data: {json.dumps({'content': '', 'reset': True})}\n\n"
+        while True:
+            try:
+                time.sleep(1)
+                if not os.path.exists(logs_path):
+                    continue
+                size = os.path.getsize(logs_path)
+                if size < last_pos:
+                    # log was cleared — re-send tail
+                    initial = "\n".join(_tail_lines(logs_path, 50))
+                    yield f"data: {json.dumps({'content': initial, 'reset': True})}\n\n"
+                    last_pos = size
+                elif size > last_pos:
+                    with open(logs_path, "r", encoding="utf-8", errors="replace") as _lf:
+                        _lf.seek(last_pos)
+                        new_text = _lf.read()
+                    last_pos = size
+                    yield f"data: {json.dumps({'content': new_text, 'reset': False})}\n\n"
+            except GeneratorExit:
+                return
+            except Exception:
+                logging.debug("SSE stream error for %s", slug, exc_info=True)
+
+    return Response(
+        gen(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+# ---------------------------------------------------------------------
+# Download task logs
+# ---------------------------------------------------------------------
+@artillery.route("/tasks/<slug>/logs/download", endpoint="download_task_logs")
+def download_task_logs(slug):
+    if not is_valid_slug(slug):
+        return jsonify({"error": "Invalid task identifier"}), 400
+    ensure_data_dirs(ensure_downloads=False)
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+
+    logs_path = os.path.join(task_folder, "logs.txt")
+    if not os.path.exists(logs_path):
+        return jsonify({"error": "No logs yet for this task"}), 404
+
+    try:
+        return send_file(logs_path, as_attachment=True, download_name=f"{slug}-logs.txt")
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+# ---------------------------------------------------------------------
+# Archived (rotated) log listing and download
+# ---------------------------------------------------------------------
+_ARCHIVED_LOG_RE = re.compile(r'^logs-(\d{4}-\d{2}-\d{2}T\d{6})\.txt$')
+
+@artillery.route("/tasks/<slug>/logs/archived", endpoint="archived_task_logs")
+def task_logs_archived(slug):
+    if not is_valid_slug(slug):
+        return jsonify({"error": "Invalid task identifier"}), 400
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+    files = []
+    try:
+        for fn in sorted(os.listdir(task_folder), reverse=True):
+            m = _ARCHIVED_LOG_RE.match(fn)
+            if m:
+                fp = os.path.join(task_folder, fn)
+                files.append({
+                    "name": fn,
+                    "ts": m.group(1),
+                    "size": os.path.getsize(fp),
+                })
+    except Exception:
+        logging.exception("Could not list archived logs for %s", slug)
+    return jsonify({"slug": slug, "files": files})
+
+@artillery.route("/tasks/<slug>/logs/archived/<filename>", endpoint="download_archived_task_log")
+def download_task_log_archived(slug, filename):
+    if not is_valid_slug(slug) or not _ARCHIVED_LOG_RE.match(filename):
+        return jsonify({"error": "Invalid"}), 400
+    task_folder = os.path.join(TASKS_ROOT, slug)
+    fp = os.path.join(task_folder, filename)
+    if not os.path.isfile(fp):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        return send_file(fp, as_attachment=True, download_name=f"{slug}-{filename}")
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+# ---------------------------------------------------------------------
+# OAuth (interactive `gallery-dl oauth:<site>` flow, per task)
+# ---------------------------------------------------------------------
+#
+# Most of gallery-dl's interactive OAuth clients finish by waiting for an
+# HTTP callback on 127.0.0.1:6414 — inside this container, not on whatever
+# machine the browser completing the provider's consent screen happens to be
+# on. There is no way around that (it's how OAuthBase.recv() is built), so
+# this flow still needs one manual step: the browser's redirect back to
+# localhost:6414 fails (nothing listens there on YOUR machine), but the
+# failed URL in the address bar still carries the `code`/`state` — paste that
+# here and we relay it, server-side, to the real listener next to it in this
+# same container.
+#
+# Pixiv (see OAUTH_STDIN_SITES) is the exception: its OAuth client never
+# opens that listener at all — it blocks on stdin instead, waiting for the
+# code to be typed/piped in. For those sites we write the pasted value
+# straight to the subprocess's stdin rather than relaying it over HTTP.
+_OAUTH_LOG_PATH = os.path.join(CONFIG_ROOT, ".oauth_run.log")
+_oauth_proc: "subprocess.Popen | None" = None
+_oauth_proc_task: str = ""
+_oauth_proc_site: str = ""
+_oauth_proc_lock = threading.Lock()
+
+
+def _oauth_client_id_configured(site: str) -> bool:
+    try:
+        conf = json.loads(read_text(CONFIG_FILE) or "{}")
+        return bool(conf.get("extractor", {}).get(site, {}).get("client-id"))
+    except Exception:
+        return False
+
+
+def _cache_has_token(path: str) -> bool:
+    """True once gallery-dl has actually written something (e.g. a
+    refresh-token) into this task's cache db — not merely once the file
+    exists. gallery-dl runs 'CREATE TABLE IF NOT EXISTS data' the instant it
+    opens the cache file, before any authentication happens, so checking
+    file existence/size alone reports "authenticated" the moment the OAuth
+    subprocess starts, regardless of whether login ever succeeded."""
+    if not os.path.exists(path):
+        return False
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            return con.execute("SELECT 1 FROM data LIMIT 1").fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+
+def _parse_oauth_paste(raw: str) -> str:
+    """Accepts a full failed-redirect URL, a bare query string (with or
+    without a leading '?'), or just "code=...&state=..." and normalizes to
+    a plain query string."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        return raw.split("?", 1)[1] if "?" in raw else ""
+    if raw.startswith("?"):
+        return raw[1:]
+    return raw
+
+
+@artillery.route("/oauth", endpoint="oauth_page")
+def oauth_page():
+    ensure_data_dirs(ensure_downloads=False)
+    tasks_list = load_tasks()
+    oauth_tasks = [t for t in tasks_list if t.get("oauth_site")]
+    client_ids = {site: _oauth_client_id_configured(site) for site in OAUTH_SITES}
+    with _oauth_proc_lock:
+        active_task = _oauth_proc_task if (_oauth_proc and _oauth_proc.poll() is None) else ""
+    return render_template(
+        "oauth.html",
+        oauth_tasks=oauth_tasks,
+        oauth_sites=OAUTH_SITES,
+        oauth_stdin_sites=OAUTH_STDIN_SITES,
+        client_ids=client_ids,
+        active_task=active_task,
+    )
+
+
+@artillery.route("/api/oauth/start", methods=["POST"], endpoint="api_oauth_start")
+def api_oauth_start():
+    global _oauth_proc, _oauth_proc_task, _oauth_proc_site
+    task_slug = request.form.get("task_slug", "").strip()
+    if not is_valid_slug(task_slug):
+        return jsonify({"error": "Invalid task"}), 400
+    task_folder = os.path.join(TASKS_ROOT, task_slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+    site = (read_text(os.path.join(task_folder, "oauth_site.txt")) or "").strip()
+    if site not in OAUTH_SITES:
+        return jsonify({"error": "Task has no OAuth site configured"}), 400
+
+    with _oauth_proc_lock:
+        if _oauth_proc and _oauth_proc.poll() is None:
+            return jsonify({"error": f"An OAuth flow for '{_oauth_proc_task}' is already running. Stop it before starting another one."}), 409
+
+        cache_file = os.path.join(task_folder, "gallery-dl-cache.sqlite3")
+        cmd = ["gallery-dl", "--config", CONFIG_FILE, f"oauth:{site}", "--cache-file", cache_file]
+        if site in OAUTH_STDIN_SITES:
+            # This subprocess's stdin is a pipe, not a real terminal, so
+            # gallery-dl's input() guard (Extractor._check_input_allowed,
+            # gated on sys.stdin.isatty()) would otherwise abort the flow
+            # the instant it tries to read the code — right after printing
+            # the login URL, before we ever get a chance to paste anything.
+            # This tells it explicitly that stdin input is allowed.
+            cmd += ["-o", "input=true"]
+        env = os.environ.copy()
+        env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/local/bin"
+        try:
+            with open(_OAUTH_LOG_PATH, "w", encoding="utf-8") as logf:
+                logf.write(f"Starting OAuth for {OAUTH_SITES[site]} (task: {task_slug})\n$ {' '.join(cmd)}\n\n")
+            logf = open(_OAUTH_LOG_PATH, "a", encoding="utf-8")
+            # stdin=PIPE unconditionally: harmless for sites that never read
+            # it, and required for OAUTH_STDIN_SITES (pixiv) to receive the
+            # pasted code — see api_oauth_paste().
+            _oauth_proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT,
+                text=True, env=env, cwd=task_folder,
+            )
+            _oauth_proc_task = task_slug
+            _oauth_proc_site = site
+        except Exception as exc:
+            logging.exception("Failed to start OAuth process")
+            return jsonify({"error": str(exc)}), 500
+    return jsonify({"ok": True, "site": site, "task_slug": task_slug})
+
+
+@artillery.route("/api/oauth/log", endpoint="api_oauth_log")
+def api_oauth_log():
+    running = False
+    with _oauth_proc_lock:
+        if _oauth_proc is not None:
+            running = _oauth_proc.poll() is None
+    content = read_text(_OAUTH_LOG_PATH) or ""
+    return jsonify({"running": running, "content": _ANSI_RE.sub('', content)})
+
+
+@artillery.route("/api/oauth/paste", methods=["POST"], endpoint="api_oauth_paste")
+def api_oauth_paste():
+    with _oauth_proc_lock:
+        exit_code = _oauth_proc.poll() if _oauth_proc else None
+        running = bool(_oauth_proc and exit_code is None)
+        proc = _oauth_proc
+        site = _oauth_proc_site
+    if not running:
+        if _oauth_proc is None:
+            return jsonify({"error": "No OAuth flow is currently running. Click Start first."}), 400
+        return jsonify({
+            "error": f"gallery-dl isn't running anymore (exit code: {exit_code}). "
+                     "Check the log below for why, then click Start again."
+        }), 400
+
+    if site in OAUTH_STDIN_SITES:
+        # No HTTP listener to relay to here — gallery-dl is blocked on
+        # input() reading its own stdin. Hand it off exactly as it parses
+        # it (rpartition on the last '='), so a bare code, a query string,
+        # or a full URL all work the same way pasting into a real terminal
+        # would. The code expires ~30s after login, so this needs to land
+        # immediately — no timeout to fail with here, it's a direct pipe write.
+        raw = (request.form.get("value", "") or "").strip()
+        if not raw:
+            return jsonify({"error": "Paste something first."}), 400
+        try:
+            proc.stdin.write(raw + "\n")
+            proc.stdin.flush()
+        except Exception as exc:
+            logging.exception("oauth stdin-relay error")
+            return jsonify({"error": f"Could not deliver code to gallery-dl: {exc}"}), 500
+        return jsonify({"ok": True})
+
+    qs = _parse_oauth_paste(request.form.get("value", ""))
+    if not qs or "code=" not in qs:
+        return jsonify({"error": "That doesn't look like it contains a 'code' value. Paste the full failed URL, or just the query string from it."}), 400
+
+    local_url = f"http://127.0.0.1:6414/?{qs}"
+    try:
+        with urllib.request.urlopen(local_url, timeout=15) as resp:
+            resp.read()
+        return jsonify({"ok": True})
+    except http.client.RemoteDisconnected:
+        # gallery-dl's local callback server tears down the connection as soon
+        # as it's accepted the request (often before finishing the token
+        # exchange with the provider) — confirmed by testing: the request
+        # still lands and gallery-dl proceeds normally, this exception alone
+        # doesn't mean delivery failed. Treat it as "sent" and let the log
+        # (polled right after on the client side) show the real outcome.
+        return jsonify({"ok": True, "note": "Delivered. Check the log for the result."})
+    except urllib.error.URLError as exc:
+        reason = str(getattr(exc, "reason", exc))
+        return jsonify({"error": f"Could not deliver code to gallery-dl: {reason}"}), 502
+    except Exception as exc:
+        logging.exception("oauth paste-relay error")
+        return jsonify({"error": str(exc)}), 500
+
+
+@artillery.route("/api/oauth/stop", methods=["POST"], endpoint="api_oauth_stop")
+def api_oauth_stop():
+    global _oauth_proc, _oauth_proc_task, _oauth_proc_site
+    with _oauth_proc_lock:
+        if _oauth_proc and _oauth_proc.poll() is None:
+            try:
+                _oauth_proc.stdin.close()
+            except Exception:
+                pass
+            _oauth_proc.terminate()
+            try:
+                _oauth_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _oauth_proc.kill()
+                _oauth_proc.wait()
+            try:
+                with open(_OAUTH_LOG_PATH, "a", encoding="utf-8") as logf:
+                    logf.write("\n[Stopped by user]\n")
+            except Exception:
+                pass
+        _oauth_proc_task = ""
+        _oauth_proc_site = ""
+    _invalidate_task_cache()
+    return jsonify({"ok": True})
+
+
+@artillery.route("/api/oauth/reset", methods=["POST"], endpoint="api_oauth_reset")
+def api_oauth_reset():
+    """Forget a task's cached OAuth state so it can be re-authenticated from
+    scratch — clears the "Auth" badge and lets a fresh 'gallery-dl oauth:...'
+    run write a new token. This deletes the task's whole cache db (it only
+    ever holds gallery-dl's own session/token cache, never the download
+    archive, which lives in a separate archive.sqlite)."""
+    task_slug = request.form.get("task_slug", "").strip()
+    if not is_valid_slug(task_slug):
+        return jsonify({"error": "Invalid task"}), 400
+    task_folder = os.path.join(TASKS_ROOT, task_slug)
+    if not os.path.isdir(task_folder):
+        return jsonify({"error": "Task not found"}), 404
+
+    with _oauth_proc_lock:
+        if _oauth_proc_task == task_slug and _oauth_proc and _oauth_proc.poll() is None:
+            return jsonify({"error": "An OAuth flow is currently running for this task. Stop it first."}), 409
+
+    cache_file = os.path.join(task_folder, "gallery-dl-cache.sqlite3")
+    try:
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+    except OSError as exc:
+        return jsonify({"error": f"Could not remove cache file: {exc}"}), 500
+
+    _invalidate_task_cache()
+    return jsonify({"ok": True})
+
+
+# ── Kiosk management ────────────────────────────────────────────────────────
+
+@artillery.route("/kiosks", methods=["GET", "POST"], endpoint="kiosks_list")
+def kiosks_list():
+    ensure_data_dirs(ensure_downloads=False)
+    os.makedirs(KIOSKS_ROOT, exist_ok=True)
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        if not name:
+            flash("Kiosk name is required.", "error")
+            return redirect(url_for("artillery.kiosks_list"))
+        kslug = slugify(name)
+        kdir = os.path.join(KIOSKS_ROOT, kslug)
+        if os.path.isdir(kdir):
+            flash(f"A kiosk named '{name}' already exists.", "error")
+            return redirect(url_for("artillery.kiosks_list"))
+        os.makedirs(os.path.join(kdir, "images"), exist_ok=True)
+        _save_kiosk_settings(kslug, {
+            "name": name,
+            "interval": max(1, int(request.form.get("interval") or 10)),
+            "order": request.form.get("order", "random"),
+        })
+        flash(f"Kiosk '{name}' created.", "success")
+        return redirect(url_for("artillery.kiosk_manage", kslug=kslug))
+    return render_template("kiosks.html", kiosks=_list_kiosks())
+
+
+@artillery.route("/kiosks/<kslug>", methods=["GET", "POST"], endpoint="kiosk_manage")
+def kiosk_manage(kslug):
+    if not is_valid_slug(kslug):
+        flash("Invalid kiosk identifier.", "error")
+        return redirect(url_for("artillery.kiosks_list"))
+    ensure_data_dirs(ensure_downloads=False)
+    kdir = os.path.join(KIOSKS_ROOT, kslug)
+    if not os.path.isdir(kdir):
+        flash("Kiosk not found.", "error")
+        return redirect(url_for("artillery.kiosks_list"))
+
+    if request.method == "POST":
+        action = request.form.get("action")
+
+        if action == "settings":
+            settings = _kiosk_settings(kslug)
+            settings["name"]       = request.form.get("name", settings.get("name", kslug)).strip() or kslug
+            settings["interval"]   = max(1, int(request.form.get("interval") or 10))
+            settings["order"]      = request.form.get("order", "random")
+            settings["transition"] = request.form.get("transition", "fade")
+            settings["trans_speed"] = max(0.1, min(3.0, float(request.form.get("trans_speed") or 0.9)))
+            settings["fit"]        = request.form.get("fit", "contain")
+            settings["background"] = request.form.get("background", "black")
+            settings["ken_burns"]  = "1" if request.form.get("ken_burns") else "0"
+            settings["show_clock"] = "1" if request.form.get("show_clock") else "0"
+            _save_kiosk_settings(kslug, settings)
+            flash("Settings saved.", "success")
+
+        elif action == "add_images":
+            uploaded = request.files.getlist("images")
+            idir = os.path.join(kdir, "images")
+            os.makedirs(idir, exist_ok=True)
+            added = 0
+            skipped = []
+            for f in uploaded:
+                if not f or not f.filename:
+                    continue
+                fn = secure_filename(f.filename)
+                if not fn:
+                    continue
+                ext = ("." + fn.rsplit(".", 1)[-1].lower()) if "." in fn else ""
+                if ext not in IMAGE_EXTS:
+                    skipped.append(fn)
+                    continue
+                raw = f.read(20 * 1024 * 1024 + 1)
+                if len(raw) > 20 * 1024 * 1024:
+                    flash(f"Skipped {fn}: too large (max 20 MB per file).", "warning")
+                    continue
+                try:
+                    with open(os.path.join(idir, fn), "wb") as out:
+                        out.write(raw)
+                    added += 1
+                except Exception:
+                    logging.warning("Could not save uploaded kiosk image %s", fn, exc_info=True)
+            if added:
+                flash(f"Uploaded {added} image(s).", "success")
+            if skipped:
+                flash(f"Skipped {len(skipped)} file(s) — unsupported type (allowed: {', '.join(sorted(IMAGE_EXTS))}).", "warning")
+
+        elif action == "remove_image":
+            fn = request.form.get("filename", "")
+            if "/" not in fn and "\\" not in fn and ".." not in fn and fn:
+                fp = os.path.join(kdir, "images", fn)
+                try:
+                    if os.path.isfile(fp):
+                        os.remove(fp)
+                        flash("Image removed.", "success")
+                except Exception:
+                    logging.warning("Could not remove kiosk image %s", fn, exc_info=True)
+                    flash("Could not remove image.", "error")
+
+        return redirect(url_for("artillery.kiosk_manage", kslug=kslug))
+
+    settings = _kiosk_settings(kslug)
+    idir = os.path.join(kdir, "images")
+    kiosk_images = []
+    if os.path.isdir(idir):
+        for fn in sorted(os.listdir(idir)):
+            if os.path.isfile(os.path.join(idir, fn)):
+                kiosk_images.append(fn)
+
+    return render_template(
+        "kiosk_manage.html",
+        kslug=kslug,
+        settings=settings,
+        kiosk_images=kiosk_images,
+    )
+
+
+@artillery.route("/kiosks/<kslug>/delete", methods=["POST"], endpoint="kiosk_delete")
+def kiosk_delete(kslug):
+    if not is_valid_slug(kslug):
+        flash("Invalid kiosk identifier.", "error")
+        return redirect(url_for("artillery.kiosks_list"))
+    kdir = os.path.join(KIOSKS_ROOT, kslug)
+    if os.path.isdir(kdir):
+        try:
+            shutil.rmtree(kdir)
+            flash("Kiosk deleted.", "success")
+        except Exception:
+            logging.exception("Could not delete kiosk %s", kslug)
+            flash("Failed to delete kiosk.", "error")
+    return redirect(url_for("artillery.kiosks_list"))
+
+
+# ── Kiosk display ────────────────────────────────────────────────────────────
+
+@artillery.route("/kiosk/<kslug>", endpoint="kiosk_display")
+def kiosk_display(kslug):
+    if not is_valid_slug(kslug):
+        return "Invalid kiosk", 400
+    kdir = os.path.join(KIOSKS_ROOT, kslug)
+    if not os.path.isdir(kdir):
+        return "Kiosk not found", 404
+    settings = _kiosk_settings(kslug)
+    return render_template("kiosk_display.html", kslug=kslug, settings=settings)
+
+
+@artillery.route("/kiosk/<kslug>/images", endpoint="kiosk_images_api")
+def kiosk_images_api(kslug):
+    if not is_valid_slug(kslug):
+        return jsonify({"error": "Invalid"}), 400
+    idir = os.path.join(KIOSKS_ROOT, kslug, "images")
+    settings = _kiosk_settings(kslug)
+    images = []
+    if os.path.isdir(idir):
+        for fn in os.listdir(idir):
+            if os.path.isfile(os.path.join(idir, fn)):
+                images.append({
+                    "name": fn,
+                    "url": url_for("kiosk_media", kslug=kslug, filename=fn),
+                })
+    return jsonify({
+        "slug": kslug,
+        "name": settings.get("name", kslug),
+        "interval": settings.get("interval", 10),
+        "order": settings.get("order", "random"),
+        "images": images,
+    })
+
+
+@artillery.route("/kiosk/<kslug>/media/<filename>", endpoint="kiosk_media")
+def kiosk_media(kslug, filename):
+    if not is_valid_slug(kslug) or "/" in filename or "\\" in filename or ".." in filename:
+        return "Invalid", 400
+    idir = os.path.join(KIOSKS_ROOT, kslug, "images")
+    return send_from_directory(idir, filename)
+
+
+@artillery.route("/kiosk/<kslug>/manifest.json", endpoint="kiosk_manifest")
+def kiosk_manifest(kslug):
+    if not is_valid_slug(kslug):
+        return "Invalid", 400
+    settings = _kiosk_settings(kslug)
+    name = settings.get("name", kslug)
+    manifest = {
+        "name": name,
+        "short_name": name,
+        "display": "fullscreen",
+        "orientation": "landscape",
+        "start_url": url_for("kiosk_display", kslug=kslug),
+        "background_color": "#000000",
+        "theme_color": "#000000",
+        "icons": [],
+    }
+    return jsonify(manifest)
+
+# ---------------------------------------------------------------------
+# Original media route (serves from /downloads)
+# ---------------------------------------------------------------------
+
+@artillery.route("/media/<path:subpath>", endpoint="media_file")
+def media_file(subpath):
+    ensure_data_dirs(ensure_downloads=True)
+    return send_from_directory(get_downloads_root(), subpath)
+
+# ---------------------------------------------------------------------
+# Main (dev only)
+# ---------------------------------------------------------------------
+
+def init_artillery(app):
+    if "SECRET_KEY" not in app.config or not app.config["SECRET_KEY"]:
+        app.config["SECRET_KEY"] = _get_or_create_secret_key()
+    curr_len = app.config.get("MAX_CONTENT_LENGTH") or 0
+    app.config["MAX_CONTENT_LENGTH"] = max(curr_len, 200 * 1024 * 1024)
+    app.config["WTF_CSRF_TIME_LIMIT"] = None
+    ensure_data_dirs()
+
+    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        try:
+            _load_task_concurrent_max_from_file()
+            _load_all_schedules()
+            if not _bg_scheduler.running:
+                _bg_scheduler.start()
+                atexit.register(lambda: _bg_scheduler.shutdown(wait=False))
+                logging.info("APScheduler started; %d job(s) loaded.", len(_bg_scheduler.get_jobs()))
+        except Exception as _e:
+            logging.warning("APScheduler failed to start: %s", _e)
+

@@ -1,0 +1,1608 @@
+{% extends "base.html" %}
+{% block main_class %}p-0{% endblock %}
+{% block content %}
+
+<style>
+/* ── Shell: full-height layout ───────────────────────────────────────── */
+/* Override body padding-top (80px) so shell snaps flush under navbar (~60px) */
+body { padding-top: 60px !important; }
+.t-shell {
+    display: flex;
+    height: calc(100vh - 60px);
+    overflow: hidden;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+.t-sidebar {
+    width: 272px;
+    min-width: 272px;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+}
+
+.t-sidebar-hd {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.t-list { flex: 1; overflow-y: auto; }
+
+/* New task button */
+#btnNew {
+    background: var(--focus-color);
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    padding: 0.22rem 0.65rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: opacity 0.15s;
+}
+#btnNew:hover { opacity: 0.82; }
+
+/* Task search */
+.t-search {
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0;
+}
+.t-search .form-control {
+    font-size: 0.76rem;
+    padding: 4px 8px;
+    border-radius: 6px;
+}
+
+/* Status filter chips */
+.t-filter-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    padding: 0 10px 7px;
+    border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0;
+}
+.t-filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-muted);
+    border-radius: 999px;
+    padding: 2px 9px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.t-filter-chip:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.t-filter-chip.active {
+    background: rgba(249,115,22,0.12);
+    border-color: var(--focus-color);
+    color: var(--focus-color);
+}
+.t-filter-chip .t-dot { margin: 0; }
+
+/* Disk usage footer */
+.t-disk-box {
+    flex-shrink: 0;
+    border-top: 1px solid var(--border-color);
+    padding: 10px 14px;
+    background: var(--bg-tertiary);
+}
+.t-disk-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+.t-disk-label-val {
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--text-primary);
+}
+.t-disk-track {
+    height: 4px;
+    background: var(--border-color);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 5px;
+}
+.t-disk-fill {
+    height: 100%;
+    background: var(--focus-color);
+    border-radius: 2px;
+    transition: width 0.4s ease;
+}
+.t-disk-fill.danger { background: #ef4444; }
+.t-disk-sub {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+}
+.t-queue-fill { background: #16a34a; }
+
+/* Task list item */
+.t-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 10px 14px 10px 11px;
+    border: none;
+    border-left: 3px solid transparent;
+    border-bottom: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: background 0.1s;
+}
+.t-item:hover { background: rgba(255,255,255,0.025); }
+.t-item.sel {
+    background: rgba(249,115,22,0.08);
+    border-left-color: var(--focus-color);
+}
+.t-item-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+.t-item-name {
+    flex: 1;
+    font-size: 0.9rem;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+.t-item-meta {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 3px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    overflow: hidden;
+    white-space: nowrap;
+    min-width: 0;
+}
+.t-item-meta-sep { color: var(--border-input); flex-shrink: 0; }
+
+/* ── Action buttons ───────────────────────────────────────────────────── */
+.t-btn {
+    border-radius: 5px;
+    padding: 0.3rem 0.75rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    border: 1px solid transparent;
+    line-height: 1.4;
+    text-decoration: none;
+    display: inline-block;
+    transition: opacity 0.12s;
+}
+.t-btn:hover { opacity: 0.82; }
+
+/* Run / Unpause — green */
+.t-btn-run  { background: #16a34a; border-color: #16a34a; color: #fff; }
+/* Stop — red */
+.t-btn-stop { background: #dc2626; border-color: #dc2626; color: #fff; }
+/* Pause — orange */
+.t-btn-pause { background: var(--focus-color); border-color: var(--focus-color); color: #fff; }
+/* Delete archive / cookies / clear logs / delete task — red */
+.t-btn-warn, .t-btn-muted, .t-btn-danger {
+    background: #dc2626; border-color: #dc2626; color: #fff;
+}
+/* Neutral — download logs, duplicate */
+.t-btn-action {
+    background: var(--bg-tertiary);
+    border-color: var(--border-input);
+    color: var(--text-primary);
+}
+
+/* Action rows */
+.t-actions-primary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+.t-actions-danger {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border-color);
+}
+.t-actions-danger .ms-auto { margin-left: auto; }
+
+/* ── Sidebar status dot ──────────────────────────────────────────────── */
+@keyframes sdot-pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+.t-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: inline-block;
+}
+.t-dot.running  { background: #22c55e; box-shadow: 0 0 4px #22c55e; animation: sdot-pulse 1.4s ease-in-out infinite; }
+.t-dot.error    { background: #ef4444; }
+.t-dot.complete { background: #22c55e; }
+.t-dot.idle-ok  { background: #22c55e; }
+.t-dot.paused   { background: #f59e0b; }
+.t-dot.idle     { background: #4b5563; }
+
+/* ── Panel header status pill ────────────────────────────────────────── */
+.t-det-status {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.17rem 0.55rem;
+    border-radius: 999px;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
+}
+.t-det-status.running  { background: rgba(34,197,94,0.14);  color: #22c55e;  border: 1px solid rgba(34,197,94,0.3); }
+.t-det-status.error    { background: rgba(239,68,68,0.12);  color: #ef4444;  border: 1px solid rgba(239,68,68,0.3); }
+.t-det-status.complete,
+.t-det-status.idle-ok  { background: rgba(34,197,94,0.08);  color: #16a34a;  border: 1px solid rgba(34,197,94,0.2); }
+.t-det-status.paused   { background: rgba(245,158,11,0.12); color: #f59e0b;  border: 1px solid rgba(245,158,11,0.3); }
+.t-det-status.idle     { background: var(--bg-tertiary);    color: var(--text-muted); border: 1px solid var(--border-color); }
+[data-theme="dark"] .t-det-status.complete,
+[data-theme="dark"] .t-det-status.idle-ok  { color: #4ade80; }
+
+/* ── Main area ───────────────────────────────────────────────────────── */
+.t-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg-primary);
+    min-width: 0;
+}
+
+/* Empty state */
+#pEmpty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 3rem;
+    text-align: center;
+    user-select: none;
+    color: var(--text-muted);
+}
+.p-icon { font-size: 2.8rem; opacity: 0.6; margin-bottom: 1rem; }
+
+/* New task panel */
+#pNew {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1.75rem 2rem;
+}
+
+/* Task detail */
+#pTask {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* Detail header */
+.t-det-hd {
+    padding: 14px 20px 0;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0;
+}
+.t-det-title {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-bottom: 10px;
+    min-width: 0;
+}
+.t-det-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    max-width: 70%;
+}
+/* Tabs */
+.t-tabs {
+    display: flex;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+.t-tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.78rem;
+    padding: 8px 18px;
+    margin-bottom: -1px;
+    transition: color 0.12s, border-color 0.12s;
+}
+.t-tab:hover { color: var(--text-primary); }
+.t-tab.on { color: var(--focus-color); border-bottom-color: var(--focus-color); }
+
+/* Tab body */
+.t-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+}
+
+/* Log box */
+#logBox {
+    font-family: monospace;
+    font-size: 0.8rem;
+    line-height: 1.55;
+    height: max(180px, calc(100vh - 340px));
+    overflow-y: auto;
+    padding: 12px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border-input);
+    background: var(--bg-secondary) !important;
+    word-break: break-all;
+}
+#logBox pre { margin: 0; white-space: pre-wrap; color: var(--text-secondary); }
+
+/* URL gate (lazy-load panel) */
+.url-gate {
+    border: 1px dashed var(--border-input);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    text-align: center;
+}
+
+/* ── Recent downloads grid ───────────────────────────────────────────── */
+.r-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 0.75rem;
+}
+.r-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 7px;
+    padding: 0.4rem;
+    overflow: hidden;
+    min-width: 0;
+    text-decoration: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+a.r-item:hover {
+    border-color: var(--focus-color);
+    box-shadow: 0 0 0 2px var(--focus-shadow);
+}
+.r-item img {
+    width: 100%;
+    height: 180px;
+    object-fit: contain;
+    border-radius: 5px;
+    display: block;
+    background: var(--bg-tertiary);
+}
+.r-item-label {
+    font-size: 0.63rem;
+    color: var(--text-muted);
+    word-break: break-all;
+    text-align: center;
+    line-height: 1.3;
+    max-height: 2.6em;
+    overflow: hidden;
+    width: 100%;
+}
+.r-item-video {
+    height: 180px;
+    justify-content: center;
+    font-size: 2rem;
+    opacity: 0.45;
+}
+
+/* ── Mobile: stack vertically ────────────────────────────────────────── */
+@media (max-width: 767px) {
+    .t-shell {
+        flex-direction: column;
+        height: auto;
+        min-height: calc(100vh - 96px);
+        border-radius: 6px;
+    }
+    .t-sidebar {
+        width: 100%;
+        min-width: unset;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+    }
+    .t-list { max-height: 45vh; }
+    .t-main { min-height: 55vh; }
+}
+</style>
+
+<div class="t-shell">
+
+  <!-- ── Left sidebar ─────────────────────────────────────────────────── -->
+  <aside class="t-sidebar">
+    <div class="t-sidebar-hd">
+      <span>{{ tasks|length }} task{{ 's' if tasks|length != 1 else '' }}</span>
+      <button type="button" id="btnNew">+ New</button>
+    </div>
+    <div class="t-search" style="position:relative;">
+      <input type="text" id="taskSearch" class="form-control"
+             placeholder="Filter tasks…" autocomplete="off" spellcheck="false"
+             style="padding-right:2rem;"/>
+      <button type="button" id="taskSearchClear"
+              style="display:none;position:absolute;right:0.4rem;top:50%;transform:translateY(-50%);
+                     background:none;border:none;padding:0;line-height:1;font-size:1rem;
+                     color:var(--text-muted);cursor:pointer;" aria-label="Clear search">&#x2715;</button>
+    </div>
+
+    <div class="t-filter-row" id="taskFilterRow" role="group" aria-label="Filter tasks by status">
+      <button type="button" class="t-filter-chip active" data-filter="all">All</button>
+      <button type="button" class="t-filter-chip" data-filter="running"><span class="t-dot running"></span>Running</button>
+      <button type="button" class="t-filter-chip" data-filter="idle"><span class="t-dot idle-ok"></span>Idle</button>
+      <button type="button" class="t-filter-chip" data-filter="paused"><span class="t-dot paused"></span>Paused</button>
+      <button type="button" class="t-filter-chip" data-filter="error"><span class="t-dot error"></span>Error</button>
+    </div>
+
+    <div class="t-list">
+      {% if tasks %}
+        {% for task in tasks %}
+        {% set st = task.status %}
+        {% set uc = task.url_count %}
+        {% set display_st = 'idle-ok' if st == 'idle' and task.last_run else st %}
+        <button type="button" class="t-item"
+          data-slug="{{ task.slug|e }}"
+          data-name="{{ task.name|e }}"
+          data-status="{{ st|e }}"
+          data-schedule="{{ (task.schedule or '')|e }}"
+          data-last-run="{{ (task.last_run or '')|e }}"
+          data-url-count="{{ uc }}"
+          data-command="{{ (task.command or '')|e }}"
+          data-action-url="{{ url_for('artillery.task_action', slug=task.slug) }}"
+          data-logs-dl-url="{{ url_for('artillery.download_task_logs', slug=task.slug) }}"
+          data-logs-api="/tasks/{{ task.slug|e }}/logs"
+          data-urls-api="/tasks/{{ task.slug|e }}/urls"
+          data-has-archive="{{ '1' if task.has_archive else '0' }}"
+          data-has-cookies="{{ '1' if task.has_cookies else '0' }}"
+          data-next-run="{{ (task.next_run or '')|e }}"
+          data-last-error="{{ (task.last_error or '')|e }}"
+          data-timeout="{{ (task.timeout or '')|e }}"
+          data-oauth-site="{{ (task.oauth_site or '')|e }}"
+          data-history-api="/tasks/{{ task.slug|e }}/history">
+          <div class="t-item-row">
+            <span class="t-item-name">{{ task.name }}</span>
+          </div>
+          <div class="t-item-meta">
+            <span class="t-dot {{ display_st }}" data-sstatus></span>
+            <span data-stext>{{ st }}</span>
+            {%- if uc -%}
+              <span class="t-item-meta-sep">&middot;</span>
+              {%- if uc >= 1000000 -%}<span>{{ "%.1f"|format(uc/1000000) }}M URLs</span>
+              {%- elif uc >= 1000 -%}<span>{{ "{:,}".format(uc) }} URLs</span>
+              {%- else -%}<span>{{ uc }} URL{{ "s" if uc != 1 else "" }}</span>
+              {%- endif -%}
+            {%- endif -%}
+            {%- if task.schedule -%}
+              <span class="t-item-meta-sep">&middot;</span><span class="t-item-next"></span>
+            {%- endif -%}
+          </div>
+        </button>
+        {% endfor %}
+      {% else %}
+        <div class="p-3 text-center" style="font-size:0.8rem;color:var(--text-muted);">No tasks yet.</div>
+      {% endif %}
+    </div>
+
+    <!-- Task queue footer -->
+    <div class="t-disk-box" id="queueBox">
+        <div class="t-disk-label">
+            <span>Task queue</span>
+            <span class="t-disk-label-val" id="queueVal">0 / {{ task_concurrent_max }} running</span>
+        </div>
+        <div class="t-disk-track">
+            <div class="t-disk-fill t-queue-fill" id="queueFill" style="width:0%"></div>
+        </div>
+        <div class="t-disk-sub" id="queueSub">Idle</div>
+    </div>
+
+    <!-- Disk usage footer -->
+    <div class="t-disk-box" id="diskBox">
+        <div class="t-disk-label">
+            <span>Downloads disk</span>
+            <span class="t-disk-label-val" id="diskVal">—</span>
+        </div>
+        <div class="t-disk-track">
+            <div class="t-disk-fill" id="diskFill" style="width:0%"></div>
+        </div>
+        <div class="t-disk-sub" id="diskSub">Loading…</div>
+    </div>
+  </aside>
+
+  <!-- ── Right main panel ─────────────────────────────────────────────── -->
+  <div class="t-main">
+
+    <!-- Empty state -->
+    <div id="pEmpty">
+      <div class="p-icon">&#9889;</div>
+      <p class="mb-1" style="font-size:0.9rem;">Select a task from the list</p>
+      <p class="small mb-0">or click <strong>+ New</strong> to create one</p>
+    </div>
+
+    <!-- New task form -->
+    <div id="pNew" style="display:none;">
+      <h5 class="mb-4" style="font-weight:700;">New Task</h5>
+      <form method="post" action="{{ url_for('artillery.tasks') }}" id="fCreate" enctype="multipart/form-data">
+        <input type="hidden" name="editing_flag" value="0"/>
+        <div class="row g-4">
+          <div class="col-md-5">
+            <div class="mb-3">
+              <label class="form-label" for="cName">Task name</label>
+              <input type="text" id="cName" name="name" class="form-control form-control-sm" required/>
+              <div class="form-text">Folder: <code>/data/tasks/&lt;name&gt;</code></div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label" for="cUrls">URLs <span class="text-muted fw-normal">(one per line, max 100)</span></label>
+              <textarea id="cUrls" name="urls" class="form-control form-control-sm" rows="8"
+                placeholder="https://example.com/profile&#10;https://example.com/gallery"></textarea>
+              <div class="mt-2">
+                <label class="form-label small text-muted mb-1">Or upload a .txt file (no limit):</label>
+                <input type="file" id="cUrlsFile" name="urls_file" class="form-control form-control-sm" accept=".txt,.csv"/>
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label d-block">Schedule</label>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="schedule_mode" id="cModeManual" value="manual" checked>
+                <label class="form-check-label small" for="cModeManual">Run once / on demand</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="schedule_mode" id="cModeCron" value="cron">
+                <label class="form-check-label small" for="cModeCron">Recurring (cron)</label>
+              </div>
+              <div class="form-text mb-2">On demand: the task sits idle until you click Run. It won't repeat unless you switch this to Recurring.</div>
+              <input type="text" id="cSched" name="schedule" class="form-control form-control-sm" placeholder="*/5 * * * *" style="display:none;" disabled/>
+              <div class="form-text" id="cSchedHelp" style="display:none;"><code>*/5 * * * *</code> = every 5 min</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Cookies <span class="text-muted fw-normal">(optional)</span></label>
+              <input type="file" name="cookies_file" class="form-control form-control-sm" accept=".txt"/>
+              <div class="form-text">Upload <code>cookies.txt</code> — passed to gallery-dl via <code>--cookies</code> automatically.</div>
+            </div>
+            <div class="mb-0">
+              <label class="form-label" for="cOauthSite">OAuth site <span class="text-muted fw-normal">(optional)</span></label>
+              <select id="cOauthSite" name="oauth_site" class="form-select form-select-sm">
+                <option value="">None</option>
+                {% for key, label in oauth_sites.items() %}
+                <option value="{{ key }}">{{ label }}</option>
+                {% endfor %}
+              </select>
+              <div class="form-text">
+                Adds <code>--cache-file</code> to the command automatically — authenticate on the
+                <a href="{{ url_for('artillery.oauth_page') }}">OAuth page</a> after saving.
+              </div>
+            </div>
+          </div>
+          <div class="col-md-7">
+            <div class="mb-3">
+              <label class="form-label">gallery-dl options</label>
+              <div class="row g-1">
+                <div class="col-6">
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc1" data-flag="--write-metadata"><label class="form-check-label small" for="cc1">Write metadata</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc2" data-flag="--write-info-json"><label class="form-check-label small" for="cc2">Save info JSON</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc3" data-flag="--write-tags"><label class="form-check-label small" for="cc3">Write tags</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc4" data-flag="--mtime date"><label class="form-check-label small" for="cc4">Set mtime from date</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc5" data-flag="--zip"><label class="form-check-label small" for="cc5">Store in ZIP</label></div>
+                </div>
+                <div class="col-6">
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc6" data-flag="--download-archive archive.sqlite"><label class="form-check-label small" for="cc6">Use archive DB</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc7" data-flag="--no-skip"><label class="form-check-label small" for="cc7">Don't skip existing</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc8" data-flag="-v"><label class="form-check-label small" for="cc8">Verbose</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc9" data-flag="--cookies cookies.txt"><label class="form-check-label small" for="cc9">Use cookies</label></div>
+                  <div class="form-check"><input class="form-check-input gdc" type="checkbox" id="cc10" data-flag="--cache-file gallery-dl-cache.sqlite3"><label class="form-check-label small" for="cc10">OAuth cache</label></div>
+                </div>
+              </div>
+            </div>
+            <div class="mb-4">
+              <label class="form-label" for="cCmd">Command</label>
+              <textarea id="cCmd" class="form-control form-control-sm" rows="2" name="command_display"></textarea>
+              <div class="form-text">Backend adds <code>--config</code> and <code>--destination</code> if missing. Tick <strong>OAuth cache</strong> for sites that need it, then authenticate from the <a href="{{ url_for('artillery.oauth_page') }}">OAuth</a> page after saving.</div>
+            </div>
+            <input type="hidden" id="cCmdH" name="command"/>
+            <button type="submit" class="btn btn-sm btn-primary btn-go px-3 py-2"><i class="fas fa-plus me-1"></i>Create task</button>
+          </div>
+
+        </div>
+      </form>
+    </div>
+
+    <!-- Task detail panel -->
+    <div id="pTask" style="display:none;">
+
+      <!-- Header + tabs -->
+      <div class="t-det-hd">
+        <div class="t-det-title">
+          <span class="t-det-name" id="dName">—</span>
+          <span class="t-det-status" id="dStatus"></span>
+        </div>
+        <ul class="t-tabs">
+          <li><button class="t-tab on" data-tab="details">Details</button></li>
+          <li><button class="t-tab"    data-tab="edit">Edit</button></li>
+          <li><button class="t-tab"    data-tab="logs">Logs</button></li>
+          <li><button class="t-tab"    data-tab="recent">Recent</button></li>
+          <li><button class="t-tab"    data-tab="stats">Stats</button></li>
+        </ul>
+      </div>
+
+      <!-- Tab bodies -->
+      <div class="t-body">
+
+        <!-- Logs -->
+        <div id="tLogs">
+          <div id="logBox"><span class="text-muted">Loading&hellip;</span></div>
+          <div class="d-flex align-items-center justify-content-between mt-2">
+            <small class="text-muted" id="logStatusText">Auto-refreshes every 1 s &middot; last 50 lines shown</small>
+            <button type="button" id="bLogToggle" class="btn btn-sm btn-neutral py-0 px-2">Pause refresh</button>
+          </div>
+        </div>
+
+        <!-- Recent downloads -->
+        <div id="tRecent" style="display:none;">
+          <div class="d-flex align-items-center justify-content-between mb-3">
+            <small class="text-muted">Most recent downloads from logs</small>
+            <button type="button" id="bRecentRefresh"
+              class="btn btn-sm btn-neutral py-0 px-2"
+              style="font-size:0.72rem;">&#8635; Refresh</button>
+          </div>
+          <div id="recentGrid" class="r-grid"></div>
+        </div>
+
+        <!-- Stats -->
+        <div id="tStats" style="display:none;">
+          <div id="statsContent"><span class="text-muted small">Loading&hellip;</span></div>
+        </div>
+
+        <!-- Details -->
+        <div id="tDetails" style="display:none;">
+          <dl class="row small mb-4" style="max-width:440px;">
+            <dt class="col-4 fw-normal text-muted">Schedule</dt>
+            <dd class="col-8" id="dSched">—</dd>
+            <dt class="col-4 fw-normal text-muted">Next run</dt>
+            <dd class="col-8" id="dNextRun">—</dd>
+            <dt class="col-4 fw-normal text-muted">Last run</dt>
+            <dd class="col-8" id="dLastRun">Never</dd>
+            <dt class="col-4 fw-normal text-muted">URLs</dt>
+            <dd class="col-8" id="dUrlCount">—</dd>
+            <dt class="col-4 fw-normal text-muted">Timeout</dt>
+            <dd class="col-8" id="dTimeout">—</dd>
+          </dl>
+          <div id="dLastError" style="display:none;" class="alert alert-danger small py-2 px-3 mb-3" style="max-width:520px;">
+            <strong>Last error:</strong><br>
+            <pre id="dLastErrorText" class="mb-0 mt-1" style="white-space:pre-wrap;font-size:0.78rem;"></pre>
+          </div>
+          <!-- Primary actions -->
+          <div class="t-actions-primary">
+            <form id="fRun" method="post" class="m-0">
+              <input type="hidden" name="action" value="run">
+              <button type="submit" id="bRun" class="t-btn t-btn-run">&#9654; Run</button>
+            </form>
+            <form id="fStop" method="post" class="m-0" style="display:none;">
+              <input type="hidden" name="action" value="stop">
+              <button type="submit" class="t-btn t-btn-stop">&#9632; Stop</button>
+            </form>
+            <form id="fPause" method="post" class="m-0">
+              <input type="hidden" name="action" value="pause">
+              <button type="submit" id="bPause" class="t-btn t-btn-pause">&#9646;&#9646; Pause</button>
+            </form>
+            <a id="bDlLogs" href="#" class="t-btn t-btn-action" style="text-decoration:none;">Download Logs</a>
+            <form id="fDuplicate" method="post" class="m-0">
+              <input type="hidden" name="action" value="duplicate">
+              <button type="submit" class="t-btn t-btn-action">&#10697; Duplicate</button>
+            </form>
+          </div>
+          <!-- Danger zone -->
+          <div class="t-actions-danger">
+            <form id="fClearLogs" method="post" class="m-0"
+              onsubmit="return confirm('Clear all logs for this task?')">
+              <input type="hidden" name="action" value="clear_logs">
+              <button type="submit" class="t-btn t-btn-muted">Clear Logs</button>
+            </form>
+            <form id="fDeleteArchive" method="post" class="m-0"
+              onsubmit="return confirm('Delete archive.sqlite? gallery-dl will re-download previously seen items on next run.')">
+              <input type="hidden" name="action" value="delete_archive">
+              <button type="submit" id="bDelArchive" class="t-btn t-btn-warn" style="display:none;">Delete Archive</button>
+            </form>
+            <form id="fDeleteCookies" method="post" class="m-0"
+              onsubmit="return confirm('Delete cookies.txt for this task?')">
+              <input type="hidden" name="action" value="delete_cookies">
+              <button type="submit" id="bDelCookies" class="t-btn t-btn-warn" style="display:none;">Delete Cookies</button>
+            </form>
+            <form id="fDelete" method="post" class="m-0 ms-auto"
+              onsubmit="return confirm('Delete this task? Its folder and logs will be removed.')">
+              <input type="hidden" name="action" value="delete">
+              <button type="submit" class="t-btn t-btn-danger">&#128465; Delete Task</button>
+            </form>
+          </div>
+        </div>
+
+        <!-- Edit -->
+        <div id="tEdit" style="display:none;">
+          <form method="post" action="{{ url_for('artillery.tasks') }}" id="fEdit" enctype="multipart/form-data">
+            <input type="hidden" name="editing_flag" value="1"/>
+            <input type="hidden" id="eOrigSlug" name="original_slug" value=""/>
+            <!-- Tells backend not to overwrite urls.txt unless the user explicitly loaded and edited them -->
+            <input type="hidden" id="eKeepUrls" name="keep_existing_urls" value="1"/>
+            <div class="row g-4">
+              <div class="col-md-5">
+                <div class="mb-3">
+                  <label class="form-label" for="eName">Task name</label>
+                  <input type="text" id="eName" name="name" class="form-control form-control-sm" required/>
+                </div>
+
+                <div class="mb-3">
+                  <label class="form-label">
+                    URLs <span id="eUrlCntLbl" class="text-muted fw-normal small"></span>
+                  </label>
+                  <!-- Shown until URLs are loaded -->
+                  <div id="urlGate" class="url-gate">
+                    <p id="urlGateMsg" class="text-muted small mb-2"></p>
+                    <button type="button" id="bLoadUrls" class="btn btn-sm btn-primary"
+                      style="display:none;"><i class="fas fa-edit me-1"></i>Load URLs for editing</button>
+
+                  </div>
+                  <!-- Hidden until loaded -->
+                  <textarea id="eUrls" name="urls" class="form-control form-control-sm"
+                    rows="8" style="display:none;"></textarea>
+                  <div class="mt-2">
+                    <label class="form-label small text-muted mb-1">Or upload a .txt file to replace (no limit):</label>
+                    <input type="file" id="eUrlsFile" name="urls_file" class="form-control form-control-sm" accept=".txt,.csv"/>
+                  </div>
+                </div>
+
+                <div class="mb-3">
+                  <label class="form-label d-block">Schedule</label>
+                  <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="radio" name="schedule_mode" id="eModeManual" value="manual">
+                    <label class="form-check-label small" for="eModeManual">Run once / on demand</label>
+                  </div>
+                  <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="radio" name="schedule_mode" id="eModeCron" value="cron">
+                    <label class="form-check-label small" for="eModeCron">Recurring (cron)</label>
+                  </div>
+                  <div class="form-text mb-2">On demand: the task sits idle until you click Run. It won't repeat unless you switch this to Recurring.</div>
+                  <input type="text" id="eSched" name="schedule" class="form-control form-control-sm" placeholder="*/5 * * * *"/>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label">Cookies <span class="text-muted fw-normal">(optional)</span></label>
+                  <div id="eCookieStatus" class="mb-1" style="font-size:0.8rem;"></div>
+                  <input type="file" id="eCookiesFile" name="cookies_file" class="form-control form-control-sm" accept=".txt"/>
+                  <div class="form-text">Upload to replace existing <code>cookies.txt</code>. gallery-dl uses it via <code>--cookies</code> automatically.</div>
+                </div>
+                <div class="mb-0">
+                  <label class="form-label" for="eOauthSite">OAuth site <span class="text-muted fw-normal">(optional)</span></label>
+                  <select id="eOauthSite" name="oauth_site" class="form-select form-select-sm">
+                    <option value="">None</option>
+                    {% for key, label in oauth_sites.items() %}
+                    <option value="{{ key }}">{{ label }}</option>
+                    {% endfor %}
+                  </select>
+                  <div class="form-text">
+                    Adds <code>--cache-file</code> to the command automatically — authenticate on the
+                    <a href="{{ url_for('artillery.oauth_page') }}">OAuth page</a> after saving.
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-md-7">
+                <div class="mb-3">
+                  <label class="form-label">gallery-dl options</label>
+                  <div class="row g-1">
+                    <div class="col-6">
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec1" data-flag="--write-metadata"><label class="form-check-label small" for="ec1">Write metadata</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec2" data-flag="--write-info-json"><label class="form-check-label small" for="ec2">Save info JSON</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec3" data-flag="--write-tags"><label class="form-check-label small" for="ec3">Write tags</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec4" data-flag="--mtime date"><label class="form-check-label small" for="ec4">Set mtime from date</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec5" data-flag="--zip"><label class="form-check-label small" for="ec5">Store in ZIP</label></div>
+                    </div>
+                    <div class="col-6">
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec6" data-flag="--download-archive archive.sqlite"><label class="form-check-label small" for="ec6">Use archive DB</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec7" data-flag="--no-skip"><label class="form-check-label small" for="ec7">Don't skip existing</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec8" data-flag="-v"><label class="form-check-label small" for="ec8">Verbose</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec9" data-flag="--cookies cookies.txt"><label class="form-check-label small" for="ec9">Use cookies</label></div>
+                      <div class="form-check"><input class="form-check-input gde" type="checkbox" id="ec10" data-flag="--cache-file gallery-dl-cache.sqlite3"><label class="form-check-label small" for="ec10">OAuth cache</label></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="mb-4">
+                  <label class="form-label" for="eCmd">Command</label>
+                  <textarea id="eCmd" class="form-control form-control-sm" rows="2" name="command_display"></textarea>
+                  <div class="form-text">Backend adds <code>--config</code> and <code>--destination</code> if missing. Tick <strong>OAuth cache</strong> for sites that need it, then authenticate from the <a href="{{ url_for('artillery.oauth_page') }}">OAuth</a> page after saving.</div>
+                </div>
+                <input type="hidden" id="eCmdH" name="command"/>
+                <button type="submit" class="btn btn-sm btn-primary btn-go px-3 py-2"><i class="fas fa-save me-1"></i>Save changes</button>
+              </div>
+
+            </div>
+          </form>
+        </div>
+
+      </div><!-- /.t-body -->
+    </div><!-- /#pTask -->
+
+  </div><!-- /.t-main -->
+</div><!-- /.t-shell -->
+
+<script>
+(function () {
+    'use strict';
+
+    /* ── Config ───────────────────────────────────────────────────────── */
+    var URL_EDIT_LIMIT = 100000; // refuse in-browser editing above this many lines
+
+    /* ── State ────────────────────────────────────────────────────────── */
+    var selSlug        = null;
+    var selUrlCount    = 0;
+    var selUrlsApi     = null;
+    var selHasCookies  = false;
+    var activeTab      = 'details';
+    var logTimer       = null;
+    var logApi         = null;
+    var logPolling     = true;
+    var autoScroll     = true;
+    var urlsLoaded     = false;
+    var urlsFetching   = false;
+    var recentLoaded   = false;
+    var recentFetching = false;
+
+    /* ── Shorthand ────────────────────────────────────────────────────── */
+    function $(id) { return document.getElementById(id); }
+
+    /* ── Refs ─────────────────────────────────────────────────────────── */
+    var pEmpty = $('pEmpty'), pNew = $('pNew'), pTask = $('pTask');
+    var btnNew = $('btnNew');
+    var dName = $('dName'), dStatus = $('dStatus');
+    var tLogs = $('tLogs'), tDetails = $('tDetails'), tEdit = $('tEdit'), tRecent = $('tRecent'), tStats = $('tStats');
+    var logBox = $('logBox'), recentGrid = $('recentGrid'), bRecentRefresh = $('bRecentRefresh'), bLogToggle = $('bLogToggle');
+    var fRun = $('fRun'), fPause = $('fPause'), fDelete = $('fDelete'), fDeleteArchive = $('fDeleteArchive');
+    var fDeleteCookies = $('fDeleteCookies'), fStop = $('fStop'), fClearLogs = $('fClearLogs');
+    var bRun = $('bRun'), bPause = $('bPause'), bDlLogs = $('bDlLogs'), bDelArchive = $('bDelArchive');
+    var bDelCookies = $('bDelCookies'), eCookieStatus = $('eCookieStatus');
+    var dSched = $('dSched'), dNextRun = $('dNextRun'), dLastRun = $('dLastRun'), dUrlCount = $('dUrlCount'), dTimeout = $('dTimeout');
+    var dLastError = $('dLastError'), dLastErrorText = $('dLastErrorText');
+    var statsContent = $('statsContent');
+    var eName = $('eName'), eUrls = $('eUrls'), eSched = $('eSched');
+    var cSched = $('cSched');
+    var cModeManual = $('cModeManual'), cModeCron = $('cModeCron'), cSchedHelp = $('cSchedHelp');
+    var eModeManual = $('eModeManual'), eModeCron = $('eModeCron');
+    var eCmd = $('eCmd'), eCmdH = $('eCmdH'), eKeepUrls = $('eKeepUrls');
+    var eOauthSite = $('eOauthSite');
+    var eUrlCntLbl = $('eUrlCntLbl'), urlGate = $('urlGate');
+    var urlGateMsg = $('urlGateMsg'), bLoadUrls = $('bLoadUrls');
+    var cCmd = $('cCmd'), cCmdH = $('cCmdH');
+    var taskSearch = $('taskSearch');
+    var taskFilterRow = $('taskFilterRow');
+
+    /* ── Helpers ──────────────────────────────────────────────────────── */
+    function displaySt(status, lastRun) {
+        return (status === 'idle' && lastRun) ? 'idle-ok' : status;
+    }
+
+    /* ── Status filter (persisted across page reloads) ─────────────────── */
+    var TASK_FILTER_KEY = 'artillery-task-filter';
+    var taskFilter = 'all';
+    try {
+        taskFilter = localStorage.getItem(TASK_FILTER_KEY) || 'all';
+    } catch (e) { /* localStorage unavailable (private mode etc.) — default to 'all' */ }
+
+    function applyFilters() {
+        var q = taskSearch.value.trim().toLowerCase();
+        document.querySelectorAll('.t-item').forEach(function (btn) {
+            var matchesSearch = !q || btn.dataset.name.toLowerCase().includes(q);
+            var matchesFilter = taskFilter === 'all' || btn.dataset.status === taskFilter;
+            btn.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+        });
+    }
+
+    function setTaskFilter(f) {
+        taskFilter = f;
+        try { localStorage.setItem(TASK_FILTER_KEY, f); } catch (e) { /* ignore */ }
+        taskFilterRow.querySelectorAll('.t-filter-chip').forEach(function (chip) {
+            chip.classList.toggle('active', chip.dataset.filter === f);
+        });
+        applyFilters();
+    }
+
+    function fmtNextRun(iso) {
+        if (!iso) return '—';
+        var diff = new Date(iso) - Date.now();
+        if (diff <= 0) return 'soon';
+        var m = Math.round(diff / 60000);
+        if (m < 1) return 'soon';
+        if (m < 60) return 'in ' + m + 'm';
+        var h = Math.floor(m / 60), r = m % 60;
+        return 'in ' + h + 'h' + (r ? ' ' + r + 'm' : '');
+    }
+
+    function fmtN(n) {
+        n = parseInt(n, 10) || 0;
+        if (!n)       return '0 URLs';
+        if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M URLs';
+        if (n >= 1e3) return n.toLocaleString() + ' URLs';
+        return n + (n === 1 ? ' URL' : ' URLs');
+    }
+
+    function fmtDate(s) { return s ? s.slice(0, 19).replace('T', ' ') : 'Never'; }
+
+    function getSelectedTaskFromQuery() {
+        try {
+            var params = new URLSearchParams(window.location.search);
+            return params.get('selected');
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /* ── Panels ───────────────────────────────────────────────────────── */
+    function showPanel(p) {
+        pEmpty.style.display = p === 'empty' ? '' : 'none';
+        pNew.style.display   = p === 'new'   ? '' : 'none';
+        pTask.style.display  = p === 'task'  ? '' : 'none';
+        if (p !== 'task') stopLog();
+    }
+
+    function switchTab(t) {
+        activeTab = t;
+        tLogs.style.display    = t === 'logs'    ? '' : 'none';
+        tDetails.style.display = t === 'details' ? '' : 'none';
+        tEdit.style.display    = t === 'edit'    ? '' : 'none';
+        tRecent.style.display  = t === 'recent'  ? '' : 'none';
+        tStats.style.display   = t === 'stats'   ? '' : 'none';
+        document.querySelectorAll('.t-tab').forEach(function (b) {
+            b.classList.toggle('on', b.dataset.tab === t);
+        });
+        if (t === 'logs' && selSlug) {
+            var api = '/tasks/' + selSlug + '/logs';
+            if (logPolling) startLog(api);
+            else fetchLog(api);
+        } else stopLog();
+        if (t === 'recent' && selSlug) loadRecent();
+        if (t === 'stats'  && selSlug) loadStats();
+    }
+
+    var selHistoryApi = '';
+    function loadStats() {
+        if (!selSlug) return;
+        var slug = selSlug;
+        var btn  = document.querySelector('.t-item[data-slug="' + slug + '"]');
+        var api  = btn ? btn.dataset.historyApi : '/tasks/' + slug + '/history';
+        statsContent.innerHTML = '<span class="text-muted small">Loading&hellip;</span>';
+        Promise.all([
+            fetch(api).then(function (r) { return r.json(); }),
+            fetch('/tasks/' + slug + '/logs/archived').then(function (r) { return r.json(); })
+        ]).then(function (results) {
+            var d    = results[0];
+            var arch = results[1];
+            var html = '';
+
+            if (!d.runs || !d.runs.length) {
+                html += '<p class="text-muted small">No runs recorded yet.</p>';
+            } else {
+                var total  = d.runs.length;
+                var ok     = d.runs.filter(function (r) { return r.success; }).length;
+                var pct    = total ? Math.round(ok / total * 100) : 0;
+                var avgDur = total ? (d.runs.reduce(function (s, r) { return s + r.duration; }, 0) / total) : 0;
+                html += '<div class="d-flex gap-4 mb-3 small">'
+                    + '<span><strong>' + total + '</strong> runs</span>'
+                    + '<span><strong>' + pct + '%</strong> success</span>'
+                    + '<span>avg <strong>' + fmtDur(avgDur) + '</strong></span>'
+                    + '</div>'
+                    + '<table class="table table-sm table-borderless small" style="max-width:480px;">'
+                    + '<thead><tr><th>Time</th><th>Result</th><th>Duration</th></tr></thead><tbody>';
+                d.runs.slice(0, 20).forEach(function (r) {
+                    var res = r.stopped ? '<span class="text-warning">stopped</span>'
+                            : r.success ? '<span class="text-success">ok</span>'
+                            : '<span class="text-danger">failed</span>';
+                    html += '<tr><td>' + fmtDate(r.ts) + '</td><td>' + res + '</td><td>' + fmtDur(r.duration) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+            }
+
+            if (arch.files && arch.files.length) {
+                html += '<hr class="my-3"><p class="small fw-semibold mb-2">Log Archive</p>'
+                    + '<ul class="list-unstyled small mb-0">';
+                arch.files.forEach(function (f) {
+                    var ts  = f.ts.replace('T', ' ').replace(/(\d{2})(\d{2})(\d{2})$/, '$1:$2:$3');
+                    var sz  = f.size < 1024 ? f.size + ' B'
+                            : f.size < 1048576 ? Math.round(f.size / 1024) + ' KB'
+                            : (f.size / 1048576).toFixed(1) + ' MB';
+                    html += '<li class="mb-1"><a href="/tasks/' + slug + '/logs/archived/' + f.name + '" class="text-decoration-none">'
+                        + ts + '</a> <span class="text-muted">(' + sz + ')</span></li>';
+                });
+                html += '</ul>';
+            }
+
+            statsContent.innerHTML = html;
+        }).catch(function () {
+            statsContent.innerHTML = '<span class="text-danger small">Failed to load history.</span>';
+        });
+    }
+
+    function fmtDur(s) {
+        if (s < 60)  return Math.round(s) + 's';
+        if (s < 3600) return Math.round(s / 60) + 'm';
+        return (s / 3600).toFixed(1) + 'h';
+    }
+
+    /* ── Task selection ───────────────────────────────────────────────── */
+    function selectTask(btn) {
+        var newSlug = btn.dataset.slug;
+        var changed = newSlug !== selSlug;
+        selSlug     = newSlug;
+        selUrlCount = parseInt(btn.dataset.urlCount, 10) || 0;
+        selUrlsApi  = btn.dataset.urlsApi;
+        if (changed) { urlsLoaded = false; recentLoaded = false; }
+
+        /* Sidebar: highlight selected */
+        document.querySelectorAll('.t-item').forEach(function (el) {
+            el.classList.toggle('sel', el.dataset.slug === selSlug);
+        });
+
+        /* Header */
+        var st = btn.dataset.status || 'idle';
+        var dst = displaySt(st, btn.dataset.lastRun);
+        dName.textContent = btn.dataset.name;
+        dStatus.className = 't-det-status ' + dst;
+        dStatus.textContent = st;
+
+        /* Details tab */
+        dSched.textContent    = btn.dataset.schedule || 'Manual only (on demand)';
+        dLastRun.textContent  = fmtDate(btn.dataset.lastRun);
+        dUrlCount.textContent = fmtN(selUrlCount);
+        dTimeout.textContent  = btn.dataset.timeout ? btn.dataset.timeout + 's' : '—';
+        var lastErr = btn.dataset.lastError || '';
+        if (lastErr && st === 'error') {
+            dLastError.style.display = '';
+            dLastErrorText.textContent = lastErr;
+        } else {
+            dLastError.style.display = 'none';
+        }
+
+        /* Action form targets */
+        var au = btn.dataset.actionUrl;
+        fRun.action = fPause.action = fStop.action = fDuplicate.action = fDelete.action = fDeleteArchive.action = fClearLogs.action = fDeleteCookies.action = au;
+        bDlLogs.href   = btn.dataset.logsDlUrl;
+        bDelArchive.style.display = (btn.dataset.hasArchive === '1') ? '' : 'none';
+        selHasCookies = btn.dataset.hasCookies === '1';
+        bDelCookies.style.display = selHasCookies ? '' : 'none';
+        eCookieStatus.innerHTML = selHasCookies
+            ? '<span style="color:var(--bs-success);">&#10003; cookies.txt present</span>'
+            : '<span class="text-muted">No cookies file</span>';
+        var isRunning = (st === 'running');
+        fRun.style.display  = isRunning ? 'none' : '';
+        fStop.style.display = isRunning ? '' : 'none';
+        setPauseBtn(st);
+        dNextRun.textContent = fmtNextRun(btn.dataset.nextRun);
+
+        /* Edit form */
+        eOrigSlug.value      = btn.dataset.slug;
+        eName.value          = btn.dataset.name;
+        eSched.value         = btn.dataset.schedule || '';
+        eModeCron.checked    = !!btn.dataset.schedule;
+        eModeManual.checked  = !btn.dataset.schedule;
+        syncScheduleMode('e');
+        eOauthSite.value      = btn.dataset.oauthSite || '';
+        eCmd.value           = btn.dataset.command;
+        eCmdH.value          = btn.dataset.command;
+        eUrlCntLbl.textContent = selUrlCount ? '— ' + fmtN(selUrlCount) : '';
+        syncEditCbs(btn.dataset.command);
+        if (changed) resetUrlGate();
+
+        showPanel('task');
+        switchTab(activeTab);
+
+        if (window.innerWidth < 768)
+            pTask.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function setPauseBtn(st) {
+        if (st === 'paused') {
+            bPause.innerHTML = '&#9654; Unpause';
+            bPause.className = 't-btn t-btn-run';
+        } else {
+            bPause.innerHTML = '&#9646;&#9646; Pause';
+            bPause.className = 't-btn t-btn-pause';
+        }
+    }
+
+    /* ── Schedule mode (create / edit forms) ─────────────────────────── */
+    function syncScheduleMode(prefix) {
+        var isCron   = prefix === 'c' ? cModeCron.checked : eModeCron.checked;
+        var schedEl  = prefix === 'c' ? cSched : eSched;
+        schedEl.style.display = isCron ? '' : 'none';
+        schedEl.disabled      = !isCron;
+        if (!isCron) schedEl.value = '';
+        if (prefix === 'c') cSchedHelp.style.display = isCron ? '' : 'none';
+    }
+
+    /* ── URL gate ─────────────────────────────────────────────────────── */
+    function resetUrlGate() {
+        eUrls.style.display   = 'none';
+        urlGate.style.display = '';
+        eKeepUrls.value       = '1';
+        eUrls.value           = '';
+
+        if (selUrlCount > URL_EDIT_LIMIT) {
+            urlGateMsg.textContent = fmtN(selUrlCount) + ' — too large to edit safely in the browser. Edit the file directly on disk.';
+            bLoadUrls.style.display = 'none';
+        } else if (selUrlCount === 0) {
+            urlGateMsg.textContent  = 'No URLs yet.';
+            bLoadUrls.style.display = 'none';
+        } else {
+            urlGateMsg.textContent  = fmtN(selUrlCount) + ' — click to load for editing.';
+            bLoadUrls.style.display = '';
+            bLoadUrls.disabled      = false;
+        }
+    }
+
+    function doLoadUrls() {
+        if (urlsFetching || !selUrlsApi) return;
+        urlsFetching        = true;
+        bLoadUrls.disabled  = true;
+        urlGateMsg.textContent = 'Loading…';
+
+        fetch(selUrlsApi)
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                urlsFetching = false;
+                if (data.error) {
+                    urlGateMsg.textContent = 'Error: ' + data.error;
+                    bLoadUrls.disabled = false;
+                } else {
+                    eUrls.value           = data.content || '';
+                    eUrls.style.display   = '';
+                    urlGate.style.display = 'none';
+                    eKeepUrls.value       = '0';
+                    urlsLoaded            = true;
+                }
+            })
+            .catch(function (err) {
+                urlsFetching           = false;
+                urlGateMsg.textContent = 'Failed: ' + err.message;
+                bLoadUrls.disabled     = false;
+            });
+    }
+
+    /* ── Recent downloads ────────────────────────────────────────────── */
+    function loadRecent(force) {
+        if (!selSlug || (recentLoaded && !force)) return;
+        if (recentFetching) return;
+        recentFetching = true;
+        recentGrid.innerHTML = '<p class="text-muted small mb-0">Loading&hellip;</p>';
+
+        fetch('/tasks/' + selSlug + '/recent')
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                recentFetching = false;
+                recentLoaded   = true;
+                if (d.error) {
+                    recentGrid.innerHTML = '<p class="text-danger small mb-0">' + d.error + '</p>';
+                    return;
+                }
+                if (!d.items || !d.items.length) {
+                    recentGrid.innerHTML = '<p class="text-muted small mb-0">No recent downloads found. Run the task to download some files.</p>';
+                    return;
+                }
+                var html = '';
+                d.items.forEach(function (item) {
+                    if (item.is_image) {
+                        html += '<a class="r-item" href="' + item.url + '" target="_blank" rel="noopener noreferrer">'
+                              + '<img src="' + item.url + '" loading="lazy" alt="">'
+                              + '<span class="r-item-label">' + item.filename + '</span>'
+                              + '</a>';
+                    } else {
+                        html += '<a class="r-item r-item-video" href="' + item.url + '" target="_blank" rel="noopener noreferrer">'
+                              + '<span>&#127916;</span>'
+                              + '<span class="r-item-label">' + item.filename + '</span>'
+                              + '</a>';
+                    }
+                });
+                recentGrid.innerHTML = html;
+            })
+            .catch(function (e) {
+                recentFetching = false;
+                recentGrid.innerHTML = '<p class="text-danger small mb-0">' + e.message + '</p>';
+            });
+    }
+
+    /* ── Log polling ──────────────────────────────────────────────────── */
+    var LOG_LEVEL_MAP = {warning:'log-warning',error:'log-error',success:'log-success',info:'log-info',debug:'log-debug'};
+
+    function colorize(text) {
+        text = text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        for (var k in LOG_LEVEL_MAP) {
+            text = text.replace(new RegExp('\\[' + k + '\\]', 'gi'),
+                '<span class="' + LOG_LEVEL_MAP[k] + '">[$&]</span>');
+        }
+        return text;
+    }
+
+    var logSource = null;
+    var logBuffer = '';
+
+    function updateLogStatusText() {
+        $('logStatusText').textContent = logPolling
+            ? 'Live · last 50 lines shown'
+            : 'Paused · last 50 lines shown';
+    }
+
+    function setLogPolling(enabled) {
+        logPolling = enabled;
+        bLogToggle.textContent = enabled ? 'Pause refresh' : 'Resume refresh';
+        updateLogStatusText();
+        if (!enabled) {
+            _closeLogSource();
+        } else if (logApi) {
+            _openLogSource(logApi);
+        }
+    }
+
+    function _renderLog(content) {
+        logBox.innerHTML = '<pre>' + colorize(content || '(no output yet)') + '</pre>';
+        if (autoScroll) logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function _closeLogSource() {
+        if (logSource) { logSource.close(); logSource = null; }
+        if (logTimer)  { clearInterval(logTimer); logTimer = null; }
+    }
+
+    function _openLogSource(api) {
+        _closeLogSource();
+        var sseUrl = api.replace('/logs', '/logs/stream');
+        var src = new EventSource(sseUrl);
+        logSource = src;
+        src.onmessage = function (e) {
+            try {
+                var d = JSON.parse(e.data);
+                if (d.reset) {
+                    logBuffer = d.content || '';
+                } else {
+                    logBuffer += d.content || '';
+                    var lines = logBuffer.split('\n');
+                    if (lines.length > 55) {
+                        logBuffer = lines.slice(lines.length - 50).join('\n');
+                    }
+                }
+                _renderLog(logBuffer);
+            } catch (_) {}
+        };
+        src.onerror = function () {
+            // SSE dropped — fall back to polling until next startLog()
+            _closeLogSource();
+            logTimer = setInterval(function () { fetchLog(api); }, 3000);
+        };
+    }
+
+    function fetchLog(api) {
+        fetch(api + '?tail=50')
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d.error) {
+                    logBox.innerHTML = '<span class="text-danger">' + d.error + '</span>';
+                } else {
+                    logBuffer = d.content || '';
+                    _renderLog(logBuffer);
+                }
+            })
+            .catch(function (e) {
+                logBox.innerHTML = '<span class="text-danger">' + e.message + '</span>';
+            });
+    }
+
+    function startLog(api) {
+        _closeLogSource();
+        logBuffer = '';
+        logApi = api;
+        if (logPolling) {
+            _openLogSource(api);
+        } else {
+            fetchLog(api);
+        }
+    }
+    function stopLog() {
+        _closeLogSource();
+    }
+
+    /* ── Edit form checkboxes ─────────────────────────────────────────── */
+    function syncEditCbs(cmd) {
+        document.querySelectorAll('.gde').forEach(function (cb) {
+            cb.checked = cb.dataset.flag ? cmd.includes(cb.dataset.flag) : false;
+        });
+    }
+
+    function patchCmd(prev, hid, flag, checked) {
+        var cmd = prev.value;
+        if (checked) {
+            cmd = cmd.includes('--input-file')
+                ? cmd.replace('--input-file', flag + ' --input-file')
+                : cmd.trimEnd() + ' ' + flag;
+        } else {
+            var esc = flag.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+            cmd = cmd.replace(new RegExp('\\s*' + esc, 'g'), '');
+        }
+        prev.value = hid.value = cmd.replace(/\s+/g, ' ').trim();
+    }
+
+    /* ── Create form ──────────────────────────────────────────────────── */
+    function buildCreateCmd() {
+        var flags = [];
+        document.querySelectorAll('.gdc:checked').forEach(function (cb) {
+            if (cb.dataset.flag) flags.push(cb.dataset.flag);
+        });
+        cCmd.value = cCmdH.value =
+            'gallery-dl' + (flags.length ? ' ' + flags.join(' ') : '') + ' --input-file urls.txt';
+    }
+
+    /* ── Status polling ───────────────────────────────────────────────── */
+    function pollStatus() {
+        fetch('/api/tasks')
+            .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+            .then(function (tasks) {
+                tasks.forEach(function (t) {
+                    var btn = document.querySelector('.t-item[data-slug="' + t.slug + '"]');
+                    if (btn) {
+                        if (t.last_run) btn.dataset.lastRun = t.last_run;
+                        btn.dataset.nextRun = t.next_run || '';
+                        var ds = displaySt(t.status, btn.dataset.lastRun);
+                        var dot = btn.querySelector('[data-sstatus]');
+                        if (dot) dot.className = 't-dot ' + ds;
+                        var stxt = btn.querySelector('[data-stext]');
+                        if (stxt) stxt.textContent = t.status;
+                        btn.dataset.status = t.status;
+                        btn.dataset.hasArchive = t.has_archive ? '1' : '0';
+                        btn.dataset.hasCookies = t.has_cookies ? '1' : '0';
+                        var nextEl = btn.querySelector('.t-item-next');
+                        if (nextEl) nextEl.textContent = fmtNextRun(t.next_run);
+                    }
+                    if (t.slug === selSlug) {
+                        var isRunning = (t.status === 'running');
+                        var panelDs = displaySt(t.status, t.last_run);
+                        dStatus.className = 't-det-status ' + panelDs;
+                        dStatus.textContent = t.status;
+                        fRun.style.display  = isRunning ? 'none' : '';
+                        fStop.style.display = isRunning ? '' : 'none';
+                        setPauseBtn(t.status);
+                        if (t.last_run) dLastRun.textContent = fmtDate(t.last_run);
+                        dNextRun.textContent = fmtNextRun(t.next_run);
+                        bDelArchive.style.display = t.has_archive ? '' : 'none';
+                        selHasCookies = !!t.has_cookies;
+                        bDelCookies.style.display = t.has_cookies ? '' : 'none';
+                        eCookieStatus.innerHTML = t.has_cookies
+                            ? '<span style="color:var(--bs-success);">&#10003; cookies.txt present</span>'
+                            : '<span class="text-muted">No cookies file</span>';
+                    }
+                });
+                applyFilters();
+            })
+            .catch(function () {});
+    }
+
+    /* ── Init ─────────────────────────────────────────────────────────── */
+    document.addEventListener('DOMContentLoaded', function () {
+
+        document.querySelectorAll('.t-item').forEach(function (btn) {
+            btn.addEventListener('click', function () { selectTask(this); });
+            var nextEl = btn.querySelector('.t-item-next');
+            if (nextEl) nextEl.textContent = fmtNextRun(btn.dataset.nextRun);
+        });
+
+        btnNew.addEventListener('click', function () {
+            selSlug = null;
+            document.querySelectorAll('.t-item').forEach(function (el) { el.classList.remove('sel'); });
+            stopLog();
+            $('fCreate').reset();
+            syncScheduleMode('c');
+            buildCreateCmd();
+            showPanel('new');
+            if (window.innerWidth < 768)
+                $('pNew').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+
+        [cModeManual, cModeCron].forEach(function (el) {
+            el.addEventListener('change', function () { syncScheduleMode('c'); });
+        });
+        [eModeManual, eModeCron].forEach(function (el) {
+            el.addEventListener('change', function () { syncScheduleMode('e'); });
+        });
+
+        document.querySelectorAll('.t-tab').forEach(function (btn) {
+            btn.addEventListener('click', function () { switchTab(this.dataset.tab); });
+        });
+
+        bLoadUrls.addEventListener('click', doLoadUrls);
+        bRecentRefresh.addEventListener('click', function () { recentLoaded = false; loadRecent(true); });
+        bLogToggle.addEventListener('click', function () {
+            setLogPolling(!logPolling);
+            if (activeTab === 'logs' && selSlug) {
+                if (logPolling) startLog('/tasks/' + selSlug + '/logs');
+                else stopLog();
+            }
+        });
+
+        document.querySelectorAll('.gde').forEach(function (cb) {
+            cb.addEventListener('change', function () { patchCmd(eCmd, eCmdH, this.dataset.flag, this.checked); });
+        });
+        eCmd.addEventListener('input', function () { eCmdH.value = this.value; });
+
+        document.querySelectorAll('.gdc').forEach(function (cb) {
+            cb.addEventListener('change', buildCreateCmd);
+        });
+        cCmd.addEventListener('input', function () { cCmdH.value = this.value; });
+
+        logBox.addEventListener('scroll', function () {
+            autoScroll = logBox.scrollTop + logBox.clientHeight >= logBox.scrollHeight - 10;
+        });
+
+        var taskSearchClear = $('taskSearchClear');
+        taskSearch.addEventListener('input', function () {
+            taskSearchClear.style.display = this.value.trim() ? '' : 'none';
+            applyFilters();
+        });
+        taskSearchClear.addEventListener('click', function () {
+            taskSearch.value = '';
+            taskSearchClear.style.display = 'none';
+            applyFilters();
+            taskSearch.focus();
+        });
+
+        taskFilterRow.querySelectorAll('.t-filter-chip').forEach(function (chip) {
+            chip.addEventListener('click', function () { setTaskFilter(chip.dataset.filter); });
+        });
+        setTaskFilter(taskFilter);
+
+        /* ── Cookies validation on submit ─────────────────────────────── */
+        var cCookiesErrEl = document.createElement('div');
+        cCookiesErrEl.className = 'text-danger small mt-1';
+        cCookiesErrEl.style.display = 'none';
+        $('cc9').closest('.form-check').after(cCookiesErrEl);
+
+        $('fCreate').addEventListener('submit', function (e) {
+            var useCookies = $('cc9').checked;
+            var hasFile = !!($('fCreate').querySelector('[name="cookies_file"]').value);
+            if (useCookies && !hasFile) {
+                e.preventDefault();
+                cCookiesErrEl.textContent = 'Select a cookies.txt file to upload, or uncheck Use cookies.';
+                cCookiesErrEl.style.display = '';
+            } else {
+                cCookiesErrEl.style.display = 'none';
+            }
+        });
+
+        var eCookiesErrEl = document.createElement('div');
+        eCookiesErrEl.className = 'text-danger small mt-1';
+        eCookiesErrEl.style.display = 'none';
+        $('ec9').closest('.form-check').after(eCookiesErrEl);
+
+        $('fEdit').addEventListener('submit', function (e) {
+            var useCookies = $('ec9').checked;
+            var hasFile = !!($('fEdit').querySelector('[name="cookies_file"]').value);
+            if (useCookies && !hasFile && !selHasCookies) {
+                e.preventDefault();
+                eCookiesErrEl.textContent = 'Select a cookies.txt file to upload, or uncheck Use cookies.';
+                eCookiesErrEl.style.display = '';
+            } else {
+                eCookiesErrEl.style.display = 'none';
+            }
+        });
+
+        /* Guard against double-submit: pause/resume (and the other action forms)
+           toggle server-side state, so a second click before the page navigates
+           away can flip the result right back. Disabling the button on submit
+           stops the resubmit. */
+        [fRun, fStop, fPause, fClearLogs, fDelete, fDeleteArchive].forEach(function (f) {
+            f.addEventListener('submit', function (e) {
+                if (e.defaultPrevented) return; /* confirm() was cancelled */
+                var b = f.querySelector('button[type="submit"]');
+                if (b) b.disabled = true;
+            });
+        });
+
+        buildCreateCmd();
+        updateLogStatusText();
+        var selectedTask = getSelectedTaskFromQuery();
+        if (selectedTask) {
+            var selectedBtn = document.querySelector('.t-item[data-slug="' + selectedTask + '"]');
+            if (selectedBtn) selectTask(selectedBtn);
+        }
+        pollStatus();
+        setInterval(pollStatus, 5000);
+
+        loadDisk();
+        setInterval(loadDisk, 60000);
+
+        loadQueue();
+        setInterval(loadQueue, 5000);
+    });
+
+    /* ── Queue status ─────────────────────────────────────────────────── */
+    function loadQueue() {
+        fetch('/api/queue')
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(d) {
+                if (!d) return;
+                var running = d.running || 0;
+                var queued  = d.queued  || 0;
+                var max     = d.max_concurrent || 1;
+                var pct = max > 0 ? Math.min(100, (running / max) * 100) : 0;
+                document.getElementById('queueVal').textContent = running + ' / ' + max + ' running';
+                document.getElementById('queueFill').style.width = pct.toFixed(1) + '%';
+                document.getElementById('queueSub').textContent =
+                    queued > 0 ? (queued + ' task' + (queued !== 1 ? 's' : '') + ' queued') : 'Idle';
+            })
+            .catch(function() {});
+    }
+
+    /* ── Disk usage ───────────────────────────────────────────────────── */
+    function fmtBytes(b) {
+        if (b >= 1e12) return (b / 1e12).toFixed(1) + ' TB';
+        if (b >= 1e9)  return (b / 1e9).toFixed(1)  + ' GB';
+        if (b >= 1e6)  return (b / 1e6).toFixed(1)  + ' MB';
+        return Math.round(b / 1024) + ' KB';
+    }
+    function loadDisk() {
+        fetch('/api/disk')
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(d) {
+                if (!d || d.error) return;
+                var pct = d.total > 0 ? (d.used / d.total * 100) : 0;
+                var fill = document.getElementById('diskFill');
+                fill.style.width = pct.toFixed(1) + '%';
+                fill.className = 't-disk-fill' + (pct >= 90 ? ' danger' : '');
+                document.getElementById('diskVal').textContent =
+                    fmtBytes(d.used) + ' / ' + fmtBytes(d.total);
+                document.getElementById('diskSub').textContent =
+                    fmtBytes(d.free) + ' free (' + pct.toFixed(0) + '% used)';
+            })
+            .catch(function() {
+                document.getElementById('diskSub').textContent = 'Unavailable';
+            });
+    }
+
+}());
+</script>
+
+{% endblock %}
