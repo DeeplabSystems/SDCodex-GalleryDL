@@ -9,6 +9,7 @@ from artillery import artillery, init_artillery
 
 def init_plugin(app, db, plugin_info=None):
     """Initialize the GalleryDL plugin."""
-    artillery.template_folder = os.path.join(plugin_dir, "templates")
-    app.register_blueprint(artillery)
-    init_artillery(app)
+    if "artillery" not in app.blueprints:
+        artillery.template_folder = os.path.join(plugin_dir, "templates")
+        app.register_blueprint(artillery)
+        init_artillery(app)
