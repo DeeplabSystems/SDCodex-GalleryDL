@@ -1049,7 +1049,8 @@ def config_page():
                 flash("Invalid task concurrency limit.", "error")
             return redirect(url_for("artillery.config_page") + "#tabScheduler")
 
-    # GET: render the config editor
+    # GET: render the config editor. When embedded as a tab in the SDCodex
+    # Settings page (?embed=1), render the fragment without the base chrome.
     config_text = read_text(CONFIG_FILE) or ""
     config_error_line = ""
     config_error_col = ""
@@ -1060,8 +1061,9 @@ def config_page():
             config_error_line = exc.lineno
             config_error_col = exc.colno
 
+    template = "config_embed.html" if request.args.get("embed") == "1" else "config.html"
     return render_template(
-        "config.html",
+        template,
         config_text=config_text,
         config_path=CONFIG_FILE,
         config_error_line=config_error_line,
