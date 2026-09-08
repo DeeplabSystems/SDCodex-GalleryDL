@@ -1006,7 +1006,71 @@ def api_tasks():
 
 @artillery.route("/config", methods=["GET", "POST"], endpoint="config_page")
 def config_page():
-    return redirect(url_for("main.settings") + "#system-config")
+    ensure_data_dirs(ensure_downloads=False)
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+
+        if action == "save":
+            submitted_text = request.form.get("config_text", "")
+            invalid_json = None
+            if submitted_text.strip():
+                try:
+                    json.loads(submitted_text)
+                except json.JSONDecodeError as exc:
+                    invalid_json = exc
+            if invalid_json:
+                flash(
+                    f"Config not saved — invalid JSON: {invalid_json.msg} "
+                    f"(line {invalid_json.lineno}, col {invalid_json.colno}).",
+                    "error",
+                )
+                return redirect(url_for("artillery.config_page") + "#tabConfig")
+            write_text(CONFIG_FILE, submitted_text)
+            flash("Gallery-dl config JSON saved.", "success")
+            return redirect(url_for("artillery.config_page") + "#tabConfig")
+
+        if action == "reset":
+            try:
+                with urllib.request.urlopen(DEFAULT_CONFIG_URL, timeout=10) as resp:
+                    default_text = resp.read().decode("utf-8")
+                write_text(CONFIG_FILE, default_text)
+                flash("Default gallery-dl config fetched and saved.", "success")
+            except Exception as exc:
+                flash(f"Failed to fetch default config: {exc}", "error")
+            return redirect(url_for("artillery.config_page") + "#tabConfig")
+
+        if action == "task_settings":
+            try:
+                v = int(request.form.get("task_concurrent_max", "5"))
+                _set_task_max_concurrent(v)
+                flash("Task concurrency limit updated.", "success")
+            except (ValueError, TypeError):
+                flash("Invalid task concurrency limit.", "error")
+            return redirect(url_for("artillery.config_page") + "#tabScheduler")
+
+    # GET: render the config editor
+    config_text = read_text(CONFIG_FILE) or ""
+    config_error_line = ""
+    config_error_col = ""
+    if config_text.strip():
+        try:
+            json.loads(config_text)
+        except json.JSONDecodeError as exc:
+            config_error_line = exc.lineno
+            config_error_col = exc.colno
+
+    return render_template(
+        "config.html",
+        config_text=config_text,
+        config_path=CONFIG_FILE,
+        config_error_line=config_error_line,
+        config_error_col=config_error_col,
+        gdl_version=_get_tool_version("gallery-dl"),
+        ytdlp_version=_get_tool_version("yt-dlp"),
+        task_concurrent_max=_task_max_concurrent,
+        tasks=load_tasks(),
+    )
 
 
 # ---------------------------------------------------------------------

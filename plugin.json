@@ -19,6 +19,11 @@
       ]
     }
   ],
+  "settings": {
+    "label": "Config & Scheduler",
+    "url": "/config",
+    "icon": "fas fa-sliders-h"
+  },
   "volumes": [
     {
       "env_var": "TASKS",
