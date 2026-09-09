@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block main_class %}container-fluid px-4 pb-4{% endblock %}
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <div class="card shadow-sm border-secondary">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+                    <h2 class="card-title mb-0">
+                        <i class="fas fa-list-alt me-2"></i>Activity Log
+                        <span id="logCountBadge" class="badge bg-secondary rounded-pill ms-2"></span>
+                    </h2>
+                    <div class="d-flex align-items-center gap-2">
+                        <label class="form-label small text-secondary mb-0 me-1" for="logLevelFilter">Level:</label>
+                        <select id="logLevelFilter" class="form-select form-select-sm" style="width:auto;">
+                            <option value="">All</option>
+                            <option value="info">Info</option>
+                            <option value="success">Success</option>
+                            <option value="warning">Warning</option>
+                            <option value="error">Error</option>
+                        </select>
+                        <button id="bLogRefresh" class="btn btn-sm btn-outline-secondary" title="Refresh now">
+                            <i class="fas fa-sync-alt me-1"></i>Refresh
+                        </button>
+                        <a id="bLogDownload" class="btn btn-sm btn-outline-secondary"
+                           href="{{ url_for('artillery.activity_logs_download') }}">
+                            <i class="fas fa-download me-1"></i>Download
+                        </a>
+                        <form method="post" action="{{ url_for('artillery.activity_logs_clear') }}"
+                              onsubmit="return confirm('Clear the entire activity log? This action cannot be undone.')"
+                              class="d-inline">
+                            <button type="submit" class="btn btn-sm btn-outline-danger">
+                                <i class="fas fa-trash me-1"></i>Clear
+                            </button>
+                        </form>
+                    </div>
+                </div>
+                <p class="text-muted small mb-1">
+                    Persistent record of task &amp; download events (created / deleted / duplicated / started /
+                    stopped / errors, and one-time downloads). File:
+                    <code id="logPath" class="small">{{ activity_path|e }}</code>
+                </p>
+                <div id="logAlerts"></div>
+
+                <table class="table table-sm table-striped align-middle" id="activityTable">
+                    <thead>
+                        <tr>
+                            <th style="width: 170px;">Timestamp</th>
+                            <th style="width: 90px;">Level</th>
+                            <th style="width: 150px;">Task</th>
+                            <th>Message</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for e in entries %}
+                        <tr class="act-row" data-level="{{ e.level|e }}">
+                            <td class="text-nowrap small text-secondary">{{ e.ts|e }}</td>
+                            <td><span class="badge {{ 'bg-danger' if e.level=='error' else ('bg-warning text-dark' if e.level=='warning' else ('bg-success' if e.level=='success' else 'bg-secondary')) }}">{{ e.level|e }}</span></td>
+                            <td class="small">{{ e.slug|e }}</td>
+                            <td style="white-space: pre-wrap; word-break: break-word;">{{ e.message|e }}</td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="text-muted text-center py-4" id="emptyRow">No activity events recorded yet.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                <small class="text-muted">Top {{ entries|length }} most recent events. Auto-refreshes.</small>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    #activityTable tbody tr.act-row td { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+</style>
+
+<script>
+(function () {
+    var $ = function (id) { return document.getElementById(id); };
+    var MATCH_BADGE = {
+        error: 'bg-danger',
+        warning: 'bg-warning text-dark',
+        success: 'bg-success',
+        info: 'bg-secondary'
+    };
+    function badgeClass(level) { return MATCH_BADGE[level] || 'bg-secondary'; }
+
+    function render(entries) {
+        var tbody = $('activityTable').querySelector('tbody');
+        var levelFilter = $('logLevelFilter').value;
+        $('logCountBadge').textContent = String(entries.length);
+        var rows = '';
+        var shown = 0;
+        entries.forEach(function (e) {
+            if (levelFilter && e.level !== levelFilter) return;
+            shown++;
+            rows += '<tr class="act-row" data-level="' + (e.level || 'info') + '">' +
+                '<td class="text-nowrap small text-secondary">' + esc(e.ts) + '</td>' +
+                '<td><span class="badge ' + badgeClass(e.level) + '">' + esc(e.level) + '</span></td>' +
+                '<td class="small">' + esc(e.slug) + '</td>' +
+                '<td style="white-space:pre-wrap;word-break:break-word;">' + esc(e.message) + '</td></tr>';
+        });
+        if (!shown) {
+            rows = '<tr><td colspan="4" class="text-muted text-center py-4">No matching activity events</td></tr>';
+        }
+        tbody.innerHTML = rows;
+    }
+
+    function esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function load() {
+        fetch('{{ url_for("artillery.activity_logs_data") }}', { cache: 'no-store' })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data && Array.isArray(data.entries)) render(data.entries);
+            })
+            .catch(function (e) { $('logAlerts').innerHTML = '<div class="alert alert-danger small py-2">Failed to load activity log: ' + esc(e.message) + '</div>'; });
+    }
+
+    $('bLogRefresh').addEventListener('click', load);
+    $('logLevelFilter').addEventListener('change', function () {
+        // Re-fetch then re-render is cheap; simpler: currently shown entries get filtered client-side next load.
+        load();
+    });
+    setInterval(load, 3000);
+    load();
+})();
+</script>
+{% endblock %}
