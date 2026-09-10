@@ -1,4 +1,13 @@
 
+{# Which single section to render when this fragment is embedded as a settings
+   tab (?tab=config|scheduler|backup). Empty means "show the full page with the
+   nested Config / Task Scheduler / Backup & Restore tabs" (direct /config). #}
+{% set section = config_tab|default('') %}
+{% set show_config = not section or section == 'config' %}
+{% set show_scheduler = not section or section == 'scheduler' %}
+{% set show_backup = not section or section == 'backup' %}
+
+{% if not section %}
 <ul class="nav nav-tabs mb-3" id="configTabs" role="tablist">
     <li class="nav-item" role="presentation">
         <button class="nav-link active" id="tab-btn-config" data-bs-toggle="tab" data-bs-target="#tabConfig"
@@ -15,7 +24,9 @@
 </ul>
 
 <div class="tab-content" id="configTabsContent">
+{% endif %}
 
+    {% if show_config %}
     <!-- ══════════════════════ Config ══════════════════════ -->
     <div class="tab-pane fade show active" id="tabConfig" role="tabpanel" aria-labelledby="tab-btn-config">
         <div class="row">
@@ -126,9 +137,11 @@
             </div>
         </div>
     </div>
+{% endif %}
 
+{% if show_scheduler %}
     <!-- ══════════════════════ Task Scheduler ══════════════════════ -->
-    <div class="tab-pane fade" id="tabScheduler" role="tabpanel" aria-labelledby="tab-btn-scheduler">
+    <div class="tab-pane fade show active" id="tabScheduler" role="tabpanel" aria-labelledby="tab-btn-scheduler">
         <div class="row">
             <div class="col-12">
                 <div class="card shadow-sm border-secondary">
@@ -168,9 +181,11 @@
             </div>
         </div>
     </div>
+{% endif %}
 
+{% if show_backup %}
     <!-- ══════════════════════ Backup & Restore ══════════════════════ -->
-    <div class="tab-pane fade" id="tabBackup" role="tabpanel" aria-labelledby="tab-btn-backup">
+    <div class="tab-pane fade show active" id="tabBackup" role="tabpanel" aria-labelledby="tab-btn-backup">
         <div class="row">
             <div class="col-12">
                 <div class="card shadow-sm border-secondary">
@@ -228,20 +243,28 @@
             </div>
         </div>
     </div>
+{% endif %}
 
+{% if not section %}
 </div>
+{% endif %}
 
 <script>
-document.getElementById('bkSelectAll').addEventListener('click', function() {
-    document.querySelectorAll('.bk-task-cb').forEach(function(cb) { cb.checked = true; });
-});
-document.getElementById('bkDeselectAll').addEventListener('click', function() {
-    document.querySelectorAll('.bk-task-cb').forEach(function(cb) { cb.checked = false; });
-});
+// ── Backup section (only present in the full page or the Backup tab) ───────
+if (document.getElementById('bkSelectAll')) {
+    document.getElementById('bkSelectAll').addEventListener('click', function() {
+        document.querySelectorAll('.bk-task-cb').forEach(function(cb) { cb.checked = true; });
+    });
+    document.getElementById('bkDeselectAll').addEventListener('click', function() {
+        document.querySelectorAll('.bk-task-cb').forEach(function(cb) { cb.checked = false; });
+    });
+}
 
 // Restore whichever tab was active before the last form submit / redirect —
 // forms that stay on this page point their action at "...#tabX", and the
-// browser keeps that fragment in the address bar across the POST.
+// browser keeps that fragment in the address bar across the POST. Only needed
+// on the full nested-tabs page.
+if (document.getElementById('configTabs')) {
 (function () {
     var hash = window.location.hash;
     if (!hash) return;
@@ -250,7 +273,9 @@ document.getElementById('bkDeselectAll').addEventListener('click', function() {
         new bootstrap.Tab(trigger).show();
     }
 })();
+}
 
+if (document.getElementById('btnCheckUpdate')) {
 (function() {
     var btnCheck  = document.getElementById('btnCheckUpdate');
     var btnApply  = document.getElementById('btnApplyUpdate');
@@ -317,8 +342,10 @@ document.getElementById('bkDeselectAll').addEventListener('click', function() {
             });
     });
 })();
+}
 
 // ── gallery-dl / yt-dlp in-place updates ────────────────────────────────
+if (document.getElementById('btnCheckToolUpdate')) {
 (function() {
     var btnCheck    = document.getElementById('btnCheckToolUpdate');
     var spinner     = document.getElementById('toolUpdateSpinner');
@@ -430,8 +457,10 @@ document.getElementById('bkDeselectAll').addEventListener('click', function() {
             });
     });
 })();
+}
 </script>
 
+{% if show_config %}
 <!--
   CodeMirror 6 config editor (progressive enhancement over the plain textarea above).
   Loaded as ES modules from esm.sh, resolved through this import map so every
@@ -638,4 +667,5 @@ form.addEventListener('submit', function () {
     textarea.value = view.state.doc.toString();
 });
 </script>
+{% endif %}
 

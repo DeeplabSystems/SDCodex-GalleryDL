@@ -157,8 +157,6 @@ ONE_TIME_PID_FILE = os.path.join(CONFIG_ROOT, "one_time_download.pid")
 ONE_TIME_STOP_FILE = os.path.join(CONFIG_ROOT, "one_time_download.stop")
 ONE_TIME_LOG_TAIL_LINES = int(os.environ.get("ONE_TIME_LOG_TAIL_LINES", "50"))
 ONE_TIME_RECENT_DOWNLOADS = int(os.environ.get("ONE_TIME_RECENT_DOWNLOADS", "16"))
-ACTIVITY_LOG_FILE = os.environ.get("ACTIVITY_LOG_FILE") or os.path.join(CONFIG_ROOT, "activity.log")
-ACTIVITY_LOG_MAX_LINES = int(os.environ.get("ACTIVITY_LOG_MAX_LINES", "2000"))
 
 TASK_TIMEOUT_SECONDS = int(os.environ.get("TASK_TIMEOUT_SECONDS", "0") or "0")
 TASK_CONCURRENT_MAX  = int(os.environ.get("TASK_CONCURRENT_MAX", "5"))
@@ -257,38 +255,7 @@ def _record_run(task_folder: str, success: bool, duration: float, stopped: bool)
         logging.exception("Could not write run history for %s", task_folder)
 
 _HISTORY_LOCK             = threading.Lock()  # serialises concurrent run_history.jsonl writes
-_ACTIVITY_LOCK            = threading.Lock()  # serialises concurrent activity.log writes
 _task_cond                = threading.Condition(threading.Lock())
-
-
-def _activity(level: str, slug: str, message: str, *, _ts: dt.datetime | None = None) -> None:
-    """Append one line to the persistent activity/audit log.
-
-    ``level`` is one of info/success/warning/error; ``slug`` identifies the
-    task ("system" or "one-time" for non-task events). This is the durable
-    equivalent of the transient flash() messages so task activity survives
-    page redirects and can be reviewed on the Logs page.
-    """
-    ts = (_ts or dt.datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] [{level:<7}] [{slug}] {message}\n"
-    try:
-        ensure_data_dirs()  # idempotent; cheap after first call
-    except Exception:
-        pass
-    try:
-        with _ACTIVITY_LOCK:
-            with open(ACTIVITY_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line)
-            try:
-                with open(ACTIVITY_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-                if len(lines) > ACTIVITY_LOG_MAX_LINES:
-                    with open(ACTIVITY_LOG_FILE, "w", encoding="utf-8") as f:
-                        f.writelines(lines[-ACTIVITY_LOG_MAX_LINES:])
-            except Exception:
-                pass
-    except Exception:
-        logging.warning("Could not write activity log: %s", exc_info=True)
 _task_max_concurrent: int = TASK_CONCURRENT_MAX  # overridden from saved file at startup
 _tasks_running: int       = 0   # currently executing gallery-dl processes
 _tasks_queued: int        = 0   # threads waiting for a concurrency slot
@@ -980,7 +947,6 @@ def tasks():
         else:
             _unschedule_task(slug)
         _invalidate_task_cache()
-        _activity("success", slug, "Task created (or updated).")
         flash("Task created (or updated).", "success")
         return redirect(url_for("artillery.tasks", selected=slug))
 
@@ -1096,6 +1062,11 @@ def config_page():
             config_error_col = exc.colno
 
     template = "config_embed.html" if request.args.get("embed") == "1" else "config.html"
+    # When embedded as a settings tab, the host page passes ?tab= to show only
+    # one section (config | scheduler | backup) instead of the nested tabs.
+    config_tab = request.args.get("tab", "")
+    if config_tab not in ("config", "scheduler", "backup"):
+        config_tab = ""
     return render_template(
         template,
         config_text=config_text,
@@ -1106,6 +1077,7 @@ def config_page():
         ytdlp_version=_get_tool_version("yt-dlp"),
         task_concurrent_max=_task_max_concurrent,
         tasks=load_tasks(),
+        config_tab=config_tab,
     )
 
 
@@ -1520,7 +1492,6 @@ def one_time_download():
         resolved_download_dir = destination
         thread = threading.Thread(target=run_one_time_download, args=(entered_url, resolved_download_dir), daemon=True)
         thread.start()
-        _activity("success", "one-time", f"One-time download started: {entered_url}")
         flash("One-time download started in the background.", "success")
         return redirect(url_for("artillery.one_time_download"))
 
@@ -1677,12 +1648,9 @@ def run_one_time_download(url: str, download_dir: str | None = None):
         with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
             if returncode == 0:
                 logf.write("\nOne-time download finished successfully.\n")
-                _activity("success", "one-time", f"One-time download finished: {url}")
             else:
                 logf.write(f"\nOne-time download exited with code {returncode}.\n")
-                _activity("error", "one-time", f"One-time download exited with code {returncode}: {url}")
     except Exception as exc:
-        _activity("error", "one-time", f"One-time download failed: {exc}")
         with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
             logf.write(f"\nERROR while running one-time download: {exc}\n")
     finally:
@@ -1714,8 +1682,6 @@ def run_task_background(task_folder: str):
     # Rotate previous log and clear transient state before starting
     _rotate_logs(task_folder)
     _clear_last_error(task_folder)
-    _task_slug_for_event = os.path.basename(task_folder.rstrip("/"))
-    _activity("info", _task_slug_for_event, "Task run starting in background.")
     try:
         if os.path.exists(error_path):
             os.remove(error_path)
@@ -1803,26 +1769,21 @@ def run_task_background(task_folder: str):
         with open(logs_path, "a", encoding="utf-8") as logf:
             if success:
                 logf.write("\nTask finished successfully.\n")
-                _activity("success", _task_slug_for_event, f"Task finished successfully in {int(duration)}s.")
             elif was_stopped:
                 logf.write("\nTask stopped.\n")
-                _activity("info", _task_slug_for_event, "Task was stopped.")
             elif timed_out:
                 logf.write(f"\nTask timed out after {timeout}s.\n")
                 Path(error_path).touch()
                 _write_last_error(task_folder, f"Timed out after {timeout}s.")
-                _activity("error", _task_slug_for_event, f"Task timed out after {timeout}s.")
             else:
                 logf.write(f"\nTask exited with code {returncode}.\n")
                 Path(error_path).touch()
                 _write_last_error(task_folder, _extract_errors_from_log(logs_path))
-                _activity("error", _task_slug_for_event, f"Task exited with code {returncode}.")
 
         _record_run(task_folder, success=success, duration=duration, stopped=was_stopped)
 
     except Exception as exc:
         logging.exception("Unhandled error in run_task_background for %s", task_folder)
-        _activity("error", _task_slug_for_event, f"Task crashed: {exc}")
         with open(logs_path, "a", encoding="utf-8") as logf:
             logf.write(f"\nERROR while running task: {exc}\n")
         try:
@@ -1880,7 +1841,6 @@ def task_action(slug):
         write_text(os.path.join(new_folder, "name.txt"), new_name)
         write_text(os.path.join(new_folder, "logs.txt"), "")
         _invalidate_task_cache()
-        _activity("success", slug, f"Task duplicated as '{new_name}'.")
         flash(f"Task duplicated as '{new_name}'.", "success")
         return redirect(url_for("artillery.tasks", selected=new_slug))
 
@@ -1889,10 +1849,8 @@ def task_action(slug):
             shutil.rmtree(task_folder)
             _unschedule_task(slug)
             _invalidate_task_cache()
-            _activity("success", slug, f"Task deleted.")
             flash(f"Task '{slug}' deleted.", "success")
         except Exception as exc:
-            _activity("error", slug, f"Failed to delete task: {exc}")
             flash(f"Failed to delete task: {exc}", "error")
         return redirect(url_for("artillery.tasks"))
 
@@ -1915,7 +1873,6 @@ def task_action(slug):
         t = threading.Thread(target=run_task_background, args=(task_folder,), daemon=True)
         t.start()
 
-        _activity("success", slug, "Task started in background.")
         flash("Task started in background. Check logs.txt for progress.", "success")
         return redirect(url_for("artillery.tasks", selected=slug))
 
@@ -1924,11 +1881,9 @@ def task_action(slug):
         with _PAUSE_LOCK:
             if os.path.exists(paused_path):
                 os.remove(paused_path)
-                _activity("info", slug, "Task unpaused.")
                 flash("Task unpaused.", "success")
             else:
                 Path(paused_path).touch()
-                _activity("info", slug, "Task paused.")
                 flash("Task paused.", "success")
         _invalidate_task_cache()
         return redirect(url_for("artillery.tasks", selected=slug))
@@ -1942,16 +1897,12 @@ def task_action(slug):
         try:
             Path(os.path.join(task_folder, "stopped")).touch()
             os.kill(int(pid_text), signal.SIGTERM)
-            _activity("info", slug, "Stop signal sent.")
             flash("Stop signal sent.", "success")
         except ProcessLookupError:
-            _activity("info", slug, "Process already finished.")
             flash("Process already finished.", "info")
         except ValueError:
-            _activity("error", slug, "Invalid PID file.")
             flash("Invalid PID file.", "error")
         except Exception as exc:
-            _activity("error", slug, f"Failed to stop task: {exc}")
             flash(f"Failed to stop task: {exc}", "error")
         _invalidate_task_cache()
         return redirect(url_for("artillery.tasks", selected=slug))
@@ -1960,10 +1911,8 @@ def task_action(slug):
         logs_path = os.path.join(task_folder, "logs.txt")
         try:
             write_text(logs_path, "")
-            _activity("info", slug, "Task logs cleared.")
             flash("Logs cleared.", "success")
         except Exception as exc:
-            _activity("error", slug, f"Failed to clear logs: {exc}")
             flash(f"Failed to clear logs: {exc}", "error")
         return redirect(url_for("artillery.tasks", selected=slug))
 
@@ -1973,10 +1922,8 @@ def task_action(slug):
             try:
                 os.remove(archive_path)
                 _invalidate_task_cache()
-                _activity("info", slug, "Download archive deleted.")
                 flash("Archive deleted. gallery-dl will re-download previously seen items on next run.", "success")
             except Exception as exc:
-                _activity("error", slug, f"Failed to delete archive: {exc}")
                 flash(f"Failed to delete archive: {exc}", "error")
             return redirect(url_for("artillery.tasks", selected=slug))
         else:
@@ -1989,10 +1936,8 @@ def task_action(slug):
             try:
                 os.remove(cookies_path)
                 _invalidate_task_cache()
-                _activity("info", slug, "Cookies deleted.")
                 flash("Cookies deleted.", "success")
             except Exception as exc:
-                _activity("error", slug, f"Failed to delete cookies: {exc}")
                 flash(f"Failed to delete cookies: {exc}", "error")
         else:
             flash("No cookies file found for this task.", "info")
@@ -2029,82 +1974,7 @@ def task_logs(slug):
 
 
 # ---------------------------------------------------------------------
-# Activity log (persistent audit of task events) - the "Logs" page
-# ---------------------------------------------------------------------
-ACTIVITY_LOG_LEVELS = {"info", "success", "warning", "error"}
-_ACTIVITY_LINE_RE = re.compile(
-    r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[\s*(\w+)\s*\] \[([^\]]*)\] (.*)$'
-)
-
-
-def _activity_entries(tail: int = None):
-    """Parse activity.log into [{line, raw, ts, level, slug, message}] newest-first."""
-    if not os.path.exists(ACTIVITY_LOG_FILE):
-        return []
-    try:
-        with open(ACTIVITY_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except Exception as exc:
-        logging.warning("Could not read activity log: %s", exc)
-        return []
-    entries = []
-    for raw in lines:
-        raw = raw.rstrip("\n")
-        if not raw.strip():
-            continue
-        ts = level = slug = message = ""
-        m = _ACTIVITY_LINE_RE.match(raw)
-        if m:
-            ts, level, slug, message = m.groups()
-        else:
-            message = raw
-        if level not in ACTIVITY_LOG_LEVELS:
-            level = "info"
-        entries.append({"line": raw, "ts": ts, "level": level, "slug": slug, "message": message})
-    entries.reverse()
-    if tail and tail > 0:
-        entries = entries[:tail]
-    return entries
-
-
-@artillery.route("/logs", endpoint="activity_logs")
-def activity_logs():
-    ensure_data_dirs()
-    entries = _activity_entries(tail=ACTIVITY_LOG_MAX_LINES)
-    return render_template(
-        "logs.html", entries=entries, activity_path=ACTIVITY_LOG_FILE,
-        auto_refresh=int(request.args.get("refresh", 1)),
-    )
-
-
-@artillery.route("/logs/data", endpoint="activity_logs_data")
-def activity_logs_data():
-    ensure_data_dirs()
-    entries = _activity_entries(tail=ACTIVITY_LOG_MAX_LINES)
-    return jsonify({
-        "entries": entries,
-        "path": ACTIVITY_LOG_FILE,
-        "count": len(entries),
-    })
-
-
-@artillery.route("/logs/download", endpoint="activity_logs_download")
-def activity_logs_download():
-    ensure_data_dirs()
-    if not os.path.exists(ACTIVITY_LOG_FILE):
-        return jsonify({"error": "No activity log yet"}), 404
-    return send_file(ACTIVITY_LOG_FILE, as_attachment=True, download_name="activity.log")
-
-
-@artillery.route("/logs/clear", methods=["POST"], endpoint="activity_logs_clear")
-def activity_logs_clear():
-    ensure_data_dirs()
-    try:
-        write_text(ACTIVITY_LOG_FILE, "")
-        _activity("info", "system", "Activity log cleared by user.")
-        return jsonify({"ok": True})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+# Task URLs endpoint (lazy-loaded by the UI)
 # ---------------------------------------------------------------------
 
 @artillery.route("/tasks/<slug>/urls", endpoint="task_urls")
