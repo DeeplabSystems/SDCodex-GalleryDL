@@ -1,3 +1,35 @@
-{# Fragment used when the config editor is embedded as a tab in the SDCodex
-   Settings page (no base.html chrome). Same content as config.html. #}
-{% include "_config_content.html" %}
+{# Rendered inside the SDCodex Settings page as a tab iframe. Unlike the full
+   page (config.html -> base.html), this must be a self-contained HTML document
+   because an iframe has no inherited stylesheet: pull in the same Bootstrap /
+   FontAwesome / core theme CSS as base.html and mirror the theme vars so the
+   section renders themed (dark or light) instead of a plain white page. #}
+<!DOCTYPE html>
+<html lang="en" data-theme="light" data-bs-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GalleryDL Config</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script>
+        // Match the parent app's saved theme (shared via localStorage) so the
+        // embed inherits the active dark/light look.
+        (function () {
+            var t = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', t);
+            document.documentElement.setAttribute('data-bs-theme', t);
+        })();
+    </script>
+</head>
+
+<body>
+    <div class="container-fluid px-4 py-3">
+        {% include "_config_content.html" %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+
+</html>
