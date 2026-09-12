@@ -4,11 +4,12 @@
 
 <style>
 /* ── Shell: full-height layout ───────────────────────────────────────── */
-/* Override body padding-top (80px) so shell snaps flush under navbar (~60px) */
-body { padding-top: 60px !important; }
+/* Core navbar is sticky (in-flow), so no body offset is needed — adding one
+   just leaves a dead gap above the header that scrolls away (header "jump").
+   Shell height tracks the measured navbar via --gdl-navbar-h (set below). */
 .t-shell {
     display: flex;
-    height: calc(100vh - 60px);
+    height: calc(100vh - var(--gdl-navbar-h, 81px));
     overflow: hidden;
 }
 
@@ -439,7 +440,7 @@ a.r-item:hover {
     .t-shell {
         flex-direction: column;
         height: auto;
-        min-height: calc(100vh - 96px);
+        min-height: calc(100vh - var(--gdl-navbar-h, 81px));
         border-radius: 6px;
     }
     .t-sidebar {
@@ -1603,6 +1604,23 @@ a.r-item:hover {
     }
 
 }());
+</script>
+<script>
+// Dock the shell just below the core sticky navbar (measured dynamically
+// so it stays correct across themes and breakpoints).
+(function () {
+    function dockShell() {
+        var nav = document.querySelector('.navbar');
+        var h = nav ? Math.ceil(nav.getBoundingClientRect().height) : 81;
+        document.documentElement.style.setProperty('--gdl-navbar-h', h + 'px');
+    }
+    dockShell();
+    window.addEventListener('resize', dockShell);
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', dockShell);
+    }
+    window.addEventListener('load', dockShell);
+})();
 </script>
 
 {% endblock %}
